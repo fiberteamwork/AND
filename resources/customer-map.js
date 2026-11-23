@@ -1,0 +1,6057 @@
+/* =========================================================
+   CUSTOMER MAP
+   CSV : ./data/customer.csv
+   Separator : ;
+   ========================================================= */
+
+console.log('[CUSTOMER_MAP] loaded version 20261103.4 (FAT/FDT XLSX)');
+
+const DATA_URL = "./data/Data FAT Full.xlsx?v=20261012.1";
+const PROJECT_DATA_URL = "./data/Data%20project.xlsx";
+const ASIANET_SURABAYA_FOCUS = {
+    longitude: 112.77226981789323,
+    latitude: -7.327167247734099,
+    zoom: 22
+};
+// Debug: when true, markers are rendered as large bright red circles to aid visibility while debugging
+// Toggle to true to force-visible markers
+const DEBUG_HIGHLIGHT_MARKERS = false;
+
+let customers = [];
+let projectRecords = [];
+let filteredProjectRecords = [];
+let projectLayer = null;
+const siteValuesCache = new Map();
+const MAX_SITE_DROPDOWN_OPTIONS = 100;
+let customerLayer = null;
+let customerSource = null;
+let customerExpandedLayer = null;
+let customerExpandedSource = null;
+let activeMapCustomers = [];
+let activeMapDrawOptions = {};
+let mapViewportRenderTimer = null;
+let filterApplyTimer = null;
+let wardChart = null;
+let odcChart = null;
+let customerDrawVersion = 0;
+let customerDrawTimeout = null;
+let initialMapFocusApplied = false;
+
+// Device geolocation layer & state
+let userLocationLayer = null;
+let userLocationFeature = null;
+let userLocationAccuracyFeature = null;
+let userLocationOverlay = null;
+let coordinateSearchLayer = null;
+let coordinateSearchOverlay = null;
+let coordinateRulerLayer = null;
+let coordinateSearchCoordinates = null;
+let coordinateRulerActive = false;
+let coordinateRulerPoints = [];
+let coordinateRulerDistanceMeters = 0;
+let coordinateRulerLineFeature = null;
+let coordinateRulerLabelFeature = null;
+const COORDINATE_SEARCH_RADIUS_METERS = 150;
+const EARTH_MEAN_RADIUS_METERS = 6371008.8;
+const WEB_MERCATOR_MAX_LATITUDE = 85.0511287798;
+
+
+// Remove stale customer layers or layers that accidentally contain customer features
+function removeStaleCustomerLayers() {
+    try {
+        if (typeof map === 'undefined' || !map || typeof map.getLayers !== 'function') return;
+        const stack = map.getLayers().getArray().slice();
+        while (stack.length) {
+            const layer = stack.shift();
+            try {
+                if (!layer) continue;
+                // If layer is a group, enqueue its children
+                if (typeof layer.getLayers === 'function') {
+                    const childLayers = layer.getLayers().getArray() || [];
+                    for (const cl of childLayers) stack.push(cl);
+                }
+                const isCustomerLayer = (layer.get && (layer.get('customerLayer') === true || layer.get('title') === 'Customer'));
+                if (isCustomerLayer) {
+                    map.removeLayer(layer);
+                    console.log('removeStaleCustomerLayers: removed explicit customer layer');
+                    continue;
+                }
+                // check source features for 'customer' property
+                const src = layer.getSource && layer.getSource();
+                if (src && typeof src.getFeatures === 'function') {
+                    const feats = src.getFeatures() || [];
+                    if (feats.some(f => f && typeof f.get === 'function' && (f.get('customer') !== undefined || f.get('groupMembers') !== undefined))) {
+                        map.removeLayer(layer);
+                        console.log('removeStaleCustomerLayers: removed layer containing customer features');
+                    }
+                }
+            } catch (e) {
+                // ignore per-layer errors
+            }
+        }
+    } catch (e) {
+        console.warn('removeStaleCustomerLayers failed', e);
+    }
+}
+
+
+/* =========================================================
+   STATUS COLORS
+   ========================================================= */
+
+const STATUS_CONFIG = {
+
+    "fat": {
+        label: "🔴 FAT",
+        color: "#ef4444"
+    },
+
+    "nonfat": {
+        label: "🔵 Non FAT",
+        color: "#3b82f6"
+    },
+
+    "default": {
+        label: "⚪ Lainnya",
+        color: "#6b7280"
+    }
+
+};
+
+const PORT_STATUS_CONFIG = {
+    full: { label: "Port FAT Full🔴", color: "#ef4444" },
+    available: { label: "Port FAT Available🟢", color: "#22c55e" },
+    noData: { label: "Belum Ada Data🟤", color: "#8b5e3c" },
+    needCheck: { label: "Need Check Input FAT🟠", color: "#f97316" },
+    needUpdateSystem: { label: "Need Update System & Spliter FAT 🔵", color: "#3b82f6" },
+    unavailable: { label: "Port FAT Unavailable⚫", color: "#111827" },
+    odcAvailable: { label: "Port ODC Available📗", color: "#16a34a" },
+    odcFull: { label: "Port ODC Full📕", color: "#dc2626" },
+    partial: { label: "Partial🟡", color: "#f59e0b" },
+    unknown: { label: "Tidak diketahui⚪", color: "#f9fafd" }
+};
+
+// Kategori yang hanya muncul untuk record ODC (dipisah dari chart FAT)
+const ODC_STATUS_KEYS = ["odcAvailable", "odcFull"];
+
+const PORT_STATUS_FILTER_KEYS = ["full", "available", "noData", "needCheck", "needUpdateSystem", "unavailable", "odcAvailable", "odcFull"];
+
+function getCustomerStatusValue(customer) {
+    const data = customer?.dataFatFull;
+    const isFdt = String(customer?.dataType || '').toUpperCase() === 'FDT';
+    const fields = isFdt
+        ? ["Status FDT", "Status FAT", "Status Port"]
+        : ["Status FAT", "Status FDT", "Status Port"];
+
+    for (const field of fields) {
+        const value = data?.[field];
+        if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+    }
+
+    return customer?.statusPort ?? customer?.status ?? '';
+}
+
+function getPortStatusKey(customer) {
+    const explicit = String(getCustomerStatusValue(customer)).trim().toLowerCase();
+
+    if (explicit.includes("unavailable")) return "unavailable";
+    // Status ODC dicek sebelum "full"/"available" karena teksnya juga mengandung kata itu
+    // (mis. "Port ODC Available📗") sehingga harus dipisah dari FAT biasa.
+    if (explicit.includes("odc") && (explicit.includes("avaible") || explicit.includes("available") || explicit.includes("idle"))) return "odcAvailable";
+    if (explicit.includes("odc") && (explicit.includes("full") || explicit.includes("penuh"))) return "odcFull";
+    if (explicit.includes("belum ada data") || explicit.includes("no data")) return "noData";
+    if (explicit.includes("need update system") || explicit.includes("spliter fat")) return "needUpdateSystem";
+    if (explicit.includes("need check") || explicit.includes("perlu pengecekan")) return "needCheck";
+    if (explicit.includes("full") || explicit.includes("penuh")) return "full";
+    if (explicit.includes("avaible") || explicit.includes("available") || explicit.includes("idle")) return "available";
+
+    const used = Number(customer?.totalUsedVisual);
+    const idle = Number(customer?.totalIdleVisual);
+    if (Number.isFinite(used) && Number.isFinite(idle)) {
+        if (used > 0 && idle <= 0) return "full";
+        if (used <= 0 && idle > 0) return "available";
+        if (used > 0 && idle > 0) return "partial";
+    }
+    return "unknown";
+}
+
+function getPortStatusColor(customer) {
+    return PORT_STATUS_CONFIG[getPortStatusKey(customer)].color;
+}
+
+/* =========================================================
+   SYMBOL STATUS FAT (dari kolom "Status FAT" Data FAT Full.xlsx)
+   Emoji di ujung nilai menentukan bentuk & warna marker:
+   📗/📕 (buku) -> segitiga, 🟢🔴🟠🟤⚫ (lingkaran) -> lingkaran.
+   ========================================================= */
+
+const FAT_STATUS_EMOJI = {
+    "📗": "availableBook",
+    "📕": "fullBook",
+    "🟢": "available",
+    "🔴": "full",
+    "🟠": "needCheck",
+    "🔵": "needUpdateSystem",
+    "🟤": "noData",
+    "⚫": "unavailable"
+};
+
+const FAT_STATUS_SYMBOL_CONFIG = {
+    availableBook: { label: "Port Available📗", color: "#16a34a", shape: "triangle" },
+    fullBook:      { label: "Port Full📕", color: "#dc2626", shape: "triangle" },
+    available:     { label: "Port Available🟢", color: "#22c55e", shape: "circle" },
+    full:          { label: "Port Full🔴", color: "#ef4444", shape: "circle" },
+    needCheck:     { label: "Need Check Input FAT🟠", color: "#f97316", shape: "circle" },
+    needUpdateSystem: { label: "Need Update System & Spliter FAT 🔵", color: "#3b82f6", shape: "circle" },
+    noData:        { label: "Belum Ada Data🟤", color: "#8b5e3c", shape: "circle" },
+    unavailable:   { label: "Port Unavailable⚫", color: "#111827", shape: "circle" },
+    unknown:       { label: "Tidak diketahui⚪", color: "#9ca3af", shape: "circle" }
+};
+
+// Kunci symbol Status FAT untuk satu customer (emoji dulu, fallback teks dasar)
+function getFATSymbolKey(customer) {
+    const raw = String(getCustomerStatusValue(customer)).trim();
+    if (!raw) return "unknown";
+
+    for (const emoji of Object.keys(FAT_STATUS_EMOJI)) {
+        if (raw.includes(emoji)) return FAT_STATUS_EMOJI[emoji];
+    }
+
+    // Fallback bila emoji tidak ikut terbaca dari file
+    const s = raw.toLowerCase();
+    if (s.includes("unavailable")) return "unavailable";
+    if (s.includes("belum ada data") || s.includes("no data")) return "noData";
+    if (s.includes("need update system") || s.includes("spliter fat")) return "needUpdateSystem";
+    if (s.includes("need check") || s.includes("perlu pengecekan")) return "needCheck";
+    if (s.includes("available") || s.includes("avaible") || s.includes("idle")) return "available";
+    if (s.includes("full") || s.includes("penuh")) return "full";
+    return "unknown";
+}
+
+function getFATSymbolConfig(customer) {
+    return FAT_STATUS_SYMBOL_CONFIG[getFATSymbolKey(customer)] || FAT_STATUS_SYMBOL_CONFIG.unknown;
+}
+
+// Image marker sesuai symbol: segitiga (buku) atau lingkaran
+function createFATSymbolImage(config, radius) {
+    const fill = new ol.style.Fill({ color: config.color });
+    const stroke = new ol.style.Stroke({ color: "#ffffff", width: 2 });
+    if (config.shape === "triangle") {
+        // Lebar segitiga (sisi = radius * akar3) disamakan dengan diameter lingkaran (2 * radius),
+        // sehingga radius disetel radius * 2 / akar3 (radius 7 -> 8, lebar ~13.9px ≈ diameter 14px).
+        // angle 0 -> segitiga menghadap ke atas.
+        return new ol.style.RegularShape({
+            points: 3,
+            radius: Math.round(radius * 2 / Math.sqrt(3)),
+            angle: 0,
+            fill,
+            stroke
+        });
+    }
+    return new ol.style.Circle({ radius, fill, stroke });
+}
+
+
+/* =========================================================
+ORMALIZE TEXT
+   ========================================================= */
+
+// Memoized normalize to avoid repeated expensive regex ops on repeated strings
+const __normalize_cache = new Map();
+function normalize(value){
+    const s = String(value ?? "");
+    if (__normalize_cache.has(s)) return __normalize_cache.get(s);
+    const out = s
+        .replace(/^\uFEFF/,'')
+        .replace(/\u00A0/g,' ')
+        .trim()
+        .replace(/\s+/g,' ');
+    __normalize_cache.set(s, out);
+    return out;
+}
+
+// Memoized normalizeKey
+const __normalizeKey_cache = new Map();
+function normalizeKey(value){
+    const s = String(value ?? '');
+    if (__normalizeKey_cache.has(s)) return __normalizeKey_cache.get(s);
+    const out = normalize(s)
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]+/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    __normalizeKey_cache.set(s, out);
+    return out;
+}
+
+function maybeLonLat(coord){
+    if (!Array.isArray(coord) || coord.length < 2) return null;
+    const x = Number(coord[0]);
+    const y = Number(coord[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    // If coordinate is already in lon/lat range, return it directly.
+    if (Math.abs(x) <= 180 && Math.abs(y) <= 90) {
+        return { longitude: x, latitude: y };
+    }
+    // Otherwise assume the input is in WebMercator and transform to lon/lat.
+    try {
+        const lonlat = ol.proj.toLonLat([x, y]);
+        return { longitude: lonlat[0], latitude: lonlat[1] };
+    } catch (e) {
+        return null;
+    }
+}
+
+function getFeatureInteriorCoordinate(feature){
+    try {
+        const geom = feature && feature.getGeometry && feature.getGeometry();
+        if (!geom) return null;
+
+        if (typeof geom.getInteriorPoint === 'function') {
+            const interior = geom.getInteriorPoint();
+            if (interior && typeof interior.getCoordinates === 'function') {
+                const coords = interior.getCoordinates();
+                const maybe = maybeLonLat(coords);
+                if (maybe) return { latitude: maybe.latitude, longitude: maybe.longitude };
+            }
+        }
+
+        const center = ol.extent.getCenter(geom.getExtent());
+        const maybe = maybeLonLat(center);
+        if (maybe) return { latitude: maybe.latitude, longitude: maybe.longitude };
+    } catch (e) {
+        // ignore geometry errors
+    }
+    return null;
+}
+
+// Fast sanitizeNumberString with small memo cache
+const __sanitize_cache = new Map();
+function sanitizeNumberString(s){
+    const key = String(s ?? '');
+    if (__sanitize_cache.has(key)) return __sanitize_cache.get(key);
+    let str = key.replace(/,/g, '.');
+    // keep only digits, dot and minus
+    // quick path for empty or common values
+    if (!str) { __sanitize_cache.set(key, NaN); return NaN; }
+    // remove any character except digits, dot and minus
+    str = str.replace(/[^0-9.\-]/g, '');
+    const parts = str.split('.');
+    if (parts.length > 2) str = parts.shift() + '.' + parts.join('');
+    if (str === '' || str === '.' || str === '-') { __sanitize_cache.set(key, NaN); return NaN; }
+    const num = parseFloat(str);
+    __sanitize_cache.set(key, num);
+    return num;
+}
+
+function isWithinIndonesiaBounds(lat, lon){
+    return Number.isFinite(lat) && Number.isFinite(lon) &&
+        lat >= -12.0 && lat <= 6.0 &&
+        lon >= 95.0 && lon <= 141.0;
+}
+
+function focusMapOnAsianetSurabaya(){
+    if (initialMapFocusApplied || typeof map === 'undefined' || !map || !map.getView) return;
+    const view = map.getView();
+    if (!view) return;
+
+    try {
+        map.updateSize();
+        view.setCenter(ol.proj.fromLonLat([
+            ASIANET_SURABAYA_FOCUS.longitude,
+            ASIANET_SURABAYA_FOCUS.latitude
+        ]));
+        view.setZoom(ASIANET_SURABAYA_FOCUS.zoom);
+        initialMapFocusApplied = true;
+        console.log('[CUSTOMER_MAP] Initial map focus: Asianet Surabaya', ASIANET_SURABAYA_FOCUS);
+    } catch (error) {
+        console.warn('[CUSTOMER_MAP] Gagal memusatkan peta ke Asianet Surabaya:', error);
+    }
+}
+
+let cityBoundaryIndex = new Map();
+let cityBoundaryAliases = new Map();
+let cityBoundarySpatialIndex = new Map();
+let cityCoordinateCheckCache = new Map();
+let siteCoordinateIndex = new Map();
+// Fallback koordinat per (kota||site) tanpa syarat ada polygon kota,
+// untuk baris yang koordinatnya sendiri tidak valid.
+let siteCityCoordinateIndex = new Map();
+const CITY_BOUNDARY_GRID_SIZE = 2000;
+
+function buildCityBoundaryIndex(){
+    cityBoundaryIndex.clear();
+    cityBoundaryAliases.clear();
+    cityBoundarySpatialIndex.clear();
+    cityCoordinateCheckCache.clear();
+
+    const layers = [
+        typeof lyr_surabaya_2 !== 'undefined' ? lyr_surabaya_2 : null,
+        typeof lyr_SIDOARJO_1 !== 'undefined' ? lyr_SIDOARJO_1 : null,
+        typeof lyr_Denpasar_1 !== 'undefined' ? lyr_Denpasar_1 : null
+    ];
+
+    for (const layer of layers) {
+        if (!layer || !layer.getSource || typeof layer.getSource().getFeatures !== 'function') continue;
+        for (const feature of layer.getSource().getFeatures() || []) {
+            const city = normalize(getFeatureValue(feature, ['CITY', 'city', 'City', 'CITYNAME']));
+            const cityKey = normalizeKey(city);
+            const geometry = feature.getGeometry && feature.getGeometry();
+            if (!cityKey || !geometry || typeof geometry.intersectsCoordinate !== 'function') continue;
+
+            if (!cityBoundaryIndex.has(cityKey)) {
+                cityBoundaryIndex.set(cityKey, []);
+                cityBoundarySpatialIndex.set(cityKey, new Map());
+            }
+            const boundary = {
+                geometry,
+                extent: geometry.getExtent()
+            };
+            cityBoundaryIndex.get(cityKey).push(boundary);
+
+            const [minX, minY, maxX, maxY] = boundary.extent;
+            const grid = cityBoundarySpatialIndex.get(cityKey);
+            for (let x = Math.floor(minX / CITY_BOUNDARY_GRID_SIZE); x <= Math.floor(maxX / CITY_BOUNDARY_GRID_SIZE); x++) {
+                for (let y = Math.floor(minY / CITY_BOUNDARY_GRID_SIZE); y <= Math.floor(maxY / CITY_BOUNDARY_GRID_SIZE); y++) {
+                    const cellKey = `${x}:${y}`;
+                    if (!grid.has(cellKey)) grid.set(cellKey, []);
+                    grid.get(cellKey).push(boundary);
+                }
+            }
+
+            const aliasKey = normalizeKey(stripAdminPrefixes(city));
+            if (aliasKey && aliasKey !== cityKey) {
+                if (!cityBoundaryAliases.has(aliasKey)) cityBoundaryAliases.set(aliasKey, new Set());
+                cityBoundaryAliases.get(aliasKey).add(cityKey);
+            }
+        }
+    }
+}
+
+function getCityBoundaryGeometries(city){
+    const cityKey = normalizeKey(city);
+    if (cityBoundaryIndex.has(cityKey)) return cityBoundaryIndex.get(cityKey);
+
+    const aliasKeys = cityBoundaryAliases.get(normalizeKey(stripAdminPrefixes(city)));
+    if (aliasKeys && aliasKeys.size === 1) {
+        return cityBoundaryIndex.get(aliasKeys.values().next().value) || [];
+    }
+    return [];
+}
+
+function getCityBoundaryCityKey(city){
+    const cityKey = normalizeKey(city);
+    if (cityBoundaryIndex.has(cityKey)) return cityKey;
+
+    const aliasKeys = cityBoundaryAliases.get(normalizeKey(stripAdminPrefixes(city)));
+    return aliasKeys && aliasKeys.size === 1 ? aliasKeys.values().next().value : '';
+}
+
+function isCoordinateWithinCity(city, latitude, longitude){
+    const cityKey = getCityBoundaryCityKey(city);
+    if (!cityKey || !isWithinIndonesiaBounds(latitude, longitude)) return null;
+    const cacheKey = `${cityKey}|${latitude}|${longitude}`;
+    if (cityCoordinateCheckCache.has(cacheKey)) return cityCoordinateCheckCache.get(cacheKey);
+
+    const coordinate = ol.proj.fromLonLat([longitude, latitude]);
+    const cellX = Math.floor(coordinate[0] / CITY_BOUNDARY_GRID_SIZE);
+    const cellY = Math.floor(coordinate[1] / CITY_BOUNDARY_GRID_SIZE);
+    const candidates = cityBoundarySpatialIndex.get(cityKey)?.get(`${cellX}:${cellY}`) || [];
+    const isWithin = candidates.some(({ extent, geometry }) => {
+        if (coordinate[0] < extent[0] || coordinate[0] > extent[2] ||
+            coordinate[1] < extent[1] || coordinate[1] > extent[3]) return false;
+        return geometry.intersectsCoordinate(coordinate);
+    });
+    cityCoordinateCheckCache.set(cacheKey, isWithin);
+    return isWithin;
+}
+
+function normalizeFATCoordinates(latitude, longitude){
+    let lat = latitude;
+    let lon = longitude;
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+        if (Math.abs(lat) > 90 && Math.abs(lon) <= 90) {
+            [lat, lon] = [lon, lat];
+        } else if ((lat >= 111 && lat <= 115) && (lon <= -6 && lon >= -8)) {
+            [lat, lon] = [lon, lat];
+        }
+    }
+    if (Number.isFinite(lat) && Math.abs(lat) > 90) lat /= 1000000;
+    if (Number.isFinite(lon) && Math.abs(lon) > 180) lon /= 1000000;
+    return { latitude: lat, longitude: lon };
+}
+
+function getFATRowCoordinates(row, mapping){
+    const fatCoordinates = normalizeFATCoordinates(
+        sanitizeNumberString(mapping.latitude ? (row[mapping.latitude] ?? '') : ''),
+        sanitizeNumberString(mapping.longitude ? (row[mapping.longitude] ?? '') : '')
+    );
+    if (isWithinIndonesiaBounds(fatCoordinates.latitude, fatCoordinates.longitude)) {
+        return fatCoordinates;
+    }
+
+    const userCoordinates = normalizeFATCoordinates(
+        sanitizeNumberString(mapping.userLatitude ? (row[mapping.userLatitude] ?? '') : ''),
+        sanitizeNumberString(mapping.userLongitude ? (row[mapping.userLongitude] ?? '') : '')
+    );
+    return isWithinIndonesiaBounds(userCoordinates.latitude, userCoordinates.longitude)
+        ? userCoordinates
+        : fatCoordinates;
+}
+
+function buildSiteCoordinateIndex(rawRows, mapping){
+    siteCoordinateIndex.clear();
+    cityCoordinateCheckCache.clear();
+    if (!Array.isArray(rawRows) || !mapping || !mapping.city || !mapping.site) return;
+
+    const candidatesBySite = new Map();
+    for (const row of rawRows) {
+        const city = normalize(row[mapping.city] ?? '');
+        const site = normalizeKey(row[mapping.site] ?? '');
+        if (!city || !site || getCityBoundaryGeometries(city).length === 0) continue;
+
+        const { latitude, longitude } = getFATRowCoordinates(row, mapping);
+        if (!isWithinIndonesiaBounds(latitude, longitude) ||
+            isCoordinateWithinCity(city, latitude, longitude) !== true) continue;
+
+        const key = `${normalizeKey(city)}||${site}`;
+        if (!candidatesBySite.has(key)) candidatesBySite.set(key, []);
+        candidatesBySite.get(key).push({ latitude, longitude });
+    }
+
+    for (const [key, candidates] of candidatesBySite) {
+        const latitudes = candidates.map(point => point.latitude).sort((a, b) => a - b);
+        const longitudes = candidates.map(point => point.longitude).sort((a, b) => a - b);
+        const middle = Math.floor(candidates.length / 2);
+        const medianLatitude = latitudes.length % 2
+            ? latitudes[middle]
+            : (latitudes[middle - 1] + latitudes[middle]) / 2;
+        const medianLongitude = longitudes.length % 2
+            ? longitudes[middle]
+            : (longitudes[middle - 1] + longitudes[middle]) / 2;
+
+        const representative = candidates.reduce((closest, point) => {
+            const distance = Math.pow(point.latitude - medianLatitude, 2) +
+                Math.pow((point.longitude - medianLongitude) * Math.cos(medianLatitude * Math.PI / 180), 2);
+            return !closest || distance < closest.distance ? { point, distance } : closest;
+        }, null);
+        if (representative) siteCoordinateIndex.set(key, representative.point);
+    }
+}
+
+// Parse visit date strings (expects dd/mm/yyyy or d/m/yyyy, but tolerates other separators)
+// Indeks koordinat per (kota||site) dari baris yang koordinatnya valid.
+// Dipakai saat sebuah baris tidak punya koordinat valid (mis. longitude hanya 1 desimal)
+// agar marker mengikuti site yang sama, bukan jatuh ke koordinat default.
+function buildSiteCityCoordinateIndex(rawRows, mapping) {
+    siteCityCoordinateIndex.clear();
+    if (!Array.isArray(rawRows) || !mapping || !mapping.city || !mapping.site) return;
+
+    const candidatesBySite = new Map();
+    for (const row of rawRows) {
+        const city = normalize(row[mapping.city] ?? '');
+        const site = normalize(row[mapping.site] ?? '');
+        if (!city || !site) continue;
+
+        const { latitude, longitude } = getFATRowCoordinates(row, mapping);
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) continue;
+        if (!isWithinIndonesiaBounds(latitude, longitude)) continue;
+
+        const latDecimals = (String(latitude).split('.')[1] || '').length;
+        const lonDecimals = (String(longitude).split('.')[1] || '').length;
+        if (latDecimals < 2 || lonDecimals < 2) continue;
+
+        const key = `${normalizeKey(city)}||${normalizeKey(site)}`;
+        if (!candidatesBySite.has(key)) candidatesBySite.set(key, []);
+        candidatesBySite.get(key).push({ latitude, longitude });
+    }
+
+    for (const [key, candidates] of candidatesBySite) {
+        const latitudes = candidates.map(point => point.latitude).sort((a, b) => a - b);
+        const longitudes = candidates.map(point => point.longitude).sort((a, b) => a - b);
+        const middle = Math.floor(candidates.length / 2);
+        const medianLatitude = latitudes.length % 2
+            ? latitudes[middle]
+            : (latitudes[middle - 1] + latitudes[middle]) / 2;
+        const medianLongitude = longitudes.length % 2
+            ? longitudes[middle]
+            : (longitudes[middle - 1] + longitudes[middle]) / 2;
+
+        const representative = candidates.reduce((closest, point) => {
+            const distance = Math.pow(point.latitude - medianLatitude, 2) +
+                Math.pow((point.longitude - medianLongitude) * Math.cos(medianLatitude * Math.PI / 180), 2);
+            return !closest || distance < closest.distance ? { point, distance } : closest;
+        }, null);
+        if (representative) siteCityCoordinateIndex.set(key, representative.point);
+    }
+}
+
+function parseVisitDate(s) {
+    if (!s) return null;
+    const str = String(s).trim();
+    // Try dd/mm/yyyy or d/m/yyyy
+    const m1 = str.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
+    if (m1) {
+        const day = m1[1].padStart(2,'0');
+        const month = m1[2].padStart(2,'0');
+        const year = m1[3];
+        return { day, month, year };
+    }
+    // Try yyyy-mm-dd
+    const m2 = str.match(/^(\d{4})[\-](\d{1,2})[\-](\d{1,2})$/);
+    if (m2) {
+        const year = m2[1];
+        const month = m2[2].padStart(2,'0');
+        const day = m2[3].padStart(2,'0');
+        return { day, month, year };
+    }
+    return null;
+}
+
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+
+/* =========================================================
+   STATUS KEY
+   ========================================================= */
+
+function getStatusKey(status) {
+
+    const s = normalize(status).toLowerCase();
+
+    if (!s || s === "-")
+        return "default";
+
+    if (s.includes("non fat") || s.includes("nonfat") || s.includes("non-fat"))
+        return "nonfat";
+
+    if (s.includes("fat"))
+        return "fat";
+
+    return "default";
+}
+
+
+/* =========================================================
+   STATUS COLOR
+   ========================================================= */
+
+function getStatusColor(status) {
+
+    return STATUS_CONFIG[
+        getStatusKey(status)
+    ].color;
+
+}
+
+
+/* =========================================================
+   CSV PARSER
+   ========================================================= */
+
+function parseCSV(text) {
+
+    // Hilangkan BOM
+    text = text.replace(/^\uFEFF/, "");
+
+    const lines = text
+        .split(/\r?\n/)
+        .filter(line => line.trim() !== "");
+
+    if (lines.length === 0) return [];
+
+    // Header
+    const headers = lines[0]
+        .split(";")
+        .map(h =>
+            String(h)
+                .replace(/^\uFEFF/, "")
+                .trim()
+                .replace(/\s+/g, " ")
+        );
+
+    // Perbaiki kemungkinan "lD Customer"
+    headers[0] = headers[0]
+        .replace(/^lD Customer$/i, "ID Customer")
+        .replace(/^Id Customer$/i, "ID Customer");
+
+    const result = [];
+
+    for (let i = 1; i < lines.length; i++) {
+
+        const cols = lines[i].split(";");
+
+        const row = {};
+
+        headers.forEach((header, index) => {
+            row[header] = (cols[index] ?? "").trim();
+        });
+
+        result.push(row);
+    }
+
+    return result;
+}
+
+// ==============================
+// ALIAS HEADER DATA FAT FULL
+// ==============================
+const FAT_HEADER_ALIASES = {
+    id:        ["check id fat", "check id fdt", "id customer", "idcustomer", "id_cust", "id", "no", "nomor", "customer id", "cust id"],
+    label:     ["label fat new", "label fat old", "fat code old", "fdt code survey", "label", "nama", "nama customer", "nama pelanggan", "customer", "customer name", "name", "pelanggan"],
+    siteId:    ["site id", "siteid", "site_id"],
+    city:      ["kota/kabupaten", "kota/kab", "kota kabupaten", "kota-kabupaten", "kota", "kabupaten", "kab/kota", "kab kota", "city", "kab", "kabkota"],
+    district:  ["kecamatan", "kec", "district"],
+    ward:      ["kelurahan", "desa", "kel", "ward", "village"],
+    site:      ["nama site", "namasite", "site", "site name", "nama sisi", "sisi", "lokasi site"],
+    status:    ["status fat", "status fdt", "status", "keterangan fat", "jenis", "jenis fat", "kategori", "tipe", "fat/non fat"],
+    ket:       ["keterangan", "ket", "catatan", "note", "notes", "remark"],
+    visitDate: ["update fat", "update fdt", "tanggal", "tgl", "tanggal visit", "tgl visit", "visit date", "tanggal fat", "tgl fat", "survey date", "date"],
+    latitude:  ["fat latitude", "fdt latitude", "latitude", "lat", "koordinat latitude", "lintang", "y"],
+    longitude: ["fat longitude", "fdt longitude", "longitude", "lon", "long", "lng", "koordinat longitude", "bujur", "x"],
+    userLatitude: ["user latitude"],
+    userLongitude: ["user longitude"],
+    splitterCount: ["jumlah splitter", "jumlah splitters", "splitter count", "splitter", "total splitter"],
+    totalPort: ["total port", "total ports", "jumlah port", "port total", "port"],
+    totalUsedVisual: ["total used (visual)", "total used visual", "used visual", "used", "total used"],
+    totalIdleVisual: ["total idle (visual)", "total idle visual", "idle visual", "idle", "total idle"]
+};
+
+// Resolve pemetaan header -> field internal, sekali per dataset (dengan cache per set header)
+const __fatHeaderCache = new Map();
+function resolveFATHeaders(rawRows) {
+    if (!Array.isArray(rawRows) || rawRows.length === 0) return {};
+    const headers = Object.keys(rawRows[0] || {});
+    const cacheKey = headers.join('\u0001');
+    if (__fatHeaderCache.has(cacheKey)) return __fatHeaderCache.get(cacheKey);
+
+    const normHeader = h => String(h || '').replace(/^\uFEFF/, '').replace(/\s+/g, ' ').trim().toLowerCase().replace(/[.:]$/, '');
+    const compact = s => String(s || '').toLowerCase().replace(/[^a-z0-9/]+/g, '');
+
+    const mapping = {};
+    for (const field of Object.keys(FAT_HEADER_ALIASES)) {
+        mapping[field] = null;
+    }
+
+    const used = new Set();
+    // Pass 1: exact (dinormalisasi) match, urutan field penting (city sebelum lat/lon dsb.)
+    const fieldOrder = ['id', 'label', 'siteId', 'city', 'district', 'ward', 'site', 'status', 'ket', 'visitDate', 'userLatitude', 'userLongitude', 'latitude', 'longitude', 'splitterCount', 'totalPort', 'totalUsedVisual', 'totalIdleVisual'];
+    for (const field of fieldOrder) {
+        const aliases = FAT_HEADER_ALIASES[field];
+        let found = null;
+        for (const alias of aliases) {
+            for (const h of headers) {
+                if (used.has(h)) continue;
+                if (normHeader(h) === alias) { found = h; break; }
+            }
+            if (found) break;
+            // compact match untuk kota/kabupaten vs kota-kabupaten dsb.
+            for (const h of headers) {
+                if (used.has(h)) continue;
+                if (compact(h) === compact(alias)) { found = h; break; }
+            }
+            if (found) break;
+        }
+        if (found) { mapping[field] = found; used.add(found); }
+    }
+    // Pass 2: fallback includes() untuk field yang belum ketemu
+    for (const field of fieldOrder) {
+        if (mapping[field]) continue;
+        const aliases = FAT_HEADER_ALIASES[field];
+        for (const alias of aliases) {
+            for (const h of headers) {
+                if (used.has(h)) continue;
+                if (normHeader(h).includes(alias) || alias.includes(normHeader(h))) {
+                    // hindari salah kunci: header pendek jangan menelan alias panjang
+                    if (normHeader(h).length < 3) continue;
+                    mapping[field] = h; used.add(h); break;
+                }
+            }
+            if (mapping[field]) break;
+        }
+    }
+
+    const normalizedHeaders = headers.map(normHeader);
+    const hasHeader = names => names.some(name => normalizedHeaders.includes(name));
+    mapping.dataType = hasHeader(["fdt_code survey", "check id fdt", "fdt_latitude", "fdt_longitude", "status fdt"])
+        ? "FDT"
+        : hasHeader(["fat code old", "check id fat", "fat_latitude", "fat_longitude", "status fat"])
+            ? "FAT"
+            : null;
+
+    const typeSpecificHeaders = mapping.dataType === 'FDT'
+        ? {
+            id: ["check id fdt", "check id fat"],
+            label: ["fdt code survey", "label fat new", "label fat old", "fat code old"],
+            visitDate: ["update fdt", "update fat"],
+            latitude: ["fdt latitude", "fat latitude", "latitude"],
+            longitude: ["fdt longitude", "fat longitude", "longitude"],
+            status: ["status fdt", "status fat", "status port", "status"]
+        }
+        : {
+            id: ["check id fat", "check id fdt"],
+            label: ["label fat new", "label fat old", "fat code old", "fdt code survey"],
+            visitDate: ["update fat", "update fdt"],
+            latitude: ["fat latitude", "fdt latitude", "latitude"],
+            longitude: ["fat longitude", "fdt longitude", "longitude"],
+            status: ["status fat", "status fdt", "status port", "status"]
+        };
+    for (const [field, preferredNames] of Object.entries(typeSpecificHeaders)) {
+        const preferredHeader = preferredNames
+            .map(name => headers.find(header => normHeader(header) === name || compact(header) === compact(name)))
+            .find(Boolean);
+        if (preferredHeader) mapping[field] = preferredHeader;
+    }
+
+    if (!mapping.site && mapping.siteId) mapping.site = mapping.siteId;
+    __fatHeaderCache.set(cacheKey, mapping);
+    console.log('[CUSTOMER_MAP] resolveFATHeaders:', JSON.stringify(mapping));
+    return mapping;
+}
+
+// Konversi satu baris object (dari XLSX/CSV) ke struktur customer internal
+function parseFATRow(row, mapping, index) {
+    const get = (field) => {
+        const key = mapping[field];
+        return key ? normalize(row[key] ?? '') : '';
+    };
+
+    let { latitude: lat, longitude: lon } = getFATRowCoordinates(row, mapping);
+
+    const splitterCount = sanitizeNumberString(mapping.splitterCount ? (row[mapping.splitterCount] ?? '') : '');
+    const totalPort = sanitizeNumberString(mapping.totalPort ? (row[mapping.totalPort] ?? '') : '');
+    const totalUsedVisual = sanitizeNumberString(mapping.totalUsedVisual ? (row[mapping.totalUsedVisual] ?? '') : '');
+    const totalIdleVisual = sanitizeNumberString(mapping.totalIdleVisual ? (row[mapping.totalIdleVisual] ?? '') : '');
+
+    let city = get('city');
+    const district = get('district');
+    const ward = get('ward');
+    const siteId = get('siteId');
+    const site = get('site') || siteId;
+    const status = get('status');
+    const ket = get('ket');
+    const visitDate = get('visitDate');
+    let label = get('label');
+    let id = get('id');
+
+    let resolvedBy = 'original';
+    if (isCoordinateWithinCity(city, lat, lon) === false) {
+        const siteKey = `${normalizeKey(city)}||${normalizeKey(site)}`;
+        const siteCoordinate = siteCoordinateIndex.get(siteKey);
+        if (siteCoordinate && isCoordinateWithinCity(city, siteCoordinate.latitude, siteCoordinate.longitude) === true) {
+            lat = siteCoordinate.latitude;
+            lon = siteCoordinate.longitude;
+            resolvedBy = 'siteReference';
+        } else {
+            console.warn('[CUSTOMER_MAP] Coordinate berada di luar batas kota dan tidak ada referensi site yang valid:', {
+                city, site, label, latitude: lat, longitude: lon
+            });
+        }
+    }
+
+    // Validasi koordinat; resolve via polygon ward bila tidak valid
+    const hasDecimals = (String(lat).split('.')[1] || '').length >= 2 && (String(lon).split('.')[1] || '').length >= 2;
+    let invalidCoord = (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) < 1e-6 || Math.abs(lon) < 1e-6 || !hasDecimals);
+    if (!invalidCoord && !isWithinIndonesiaBounds(lat, lon)) invalidCoord = true;
+
+    if (invalidCoord) {
+        let coord = getCoordinateFromCsvWard(city, district, ward) || getCoordinateFromWard(city, district, ward);
+        if (coord) {
+            resolvedBy = 'wardIndex';
+            lat = coord.latitude; lon = coord.longitude;
+        } else {
+            // Fallback: pakai koordinat site yang sama dari baris lain (lebih akurat dari kota/default)
+            const siteCoord = siteCityCoordinateIndex.get(`${normalizeKey(city)}||${normalizeKey(site)}`);
+            if (siteCoord && Number.isFinite(siteCoord.latitude) && Number.isFinite(siteCoord.longitude)) {
+                lat = siteCoord.latitude; lon = siteCoord.longitude; resolvedBy = 'siteReference';
+            } else {
+                const cityFallback = getCoordinateFromCity(city);
+                if (cityFallback) { lat = cityFallback.latitude; lon = cityFallback.longitude; resolvedBy = 'cityFallback'; }
+                else { lat = -7.33; lon = 112.73; resolvedBy = 'default'; }
+            }
+        }
+    }
+
+    return {
+        id: id || label || ('ROW' + (index + 1)),
+        label,
+        username: label,
+        city,
+        siteId,
+        district,
+        ward,
+        site,
+        team: '',
+        vendor: '',
+        status,
+        dataType: mapping.dataType || 'FAT',
+        ket,
+        visitDate,
+        latitude: lat,
+        longitude: lon,
+        splitterCount: Number.isFinite(splitterCount) ? splitterCount : undefined,
+        totalPort: Number.isFinite(totalPort) ? totalPort : undefined,
+        totalUsedVisual: Number.isFinite(totalUsedVisual) ? totalUsedVisual : undefined,
+        totalIdleVisual: Number.isFinite(totalIdleVisual) ? totalIdleVisual : undefined,
+        dataFatFull: row,
+        resolvedBy
+    };
+}
+
+function fallbackParseCustomerRows(raw) {
+    const customers = [];
+    if (!Array.isArray(raw) || raw.length === 0) return customers;
+    // Coba parser FAT terlebih dahulu (mapping header adaptif)
+    const mapping = resolveFATHeaders(raw);
+    if (mapping && (mapping.label || mapping.site || mapping.city)) {
+        // Pastikan indeks fallback site selalu mengikuti dataset yang sedang diparse.
+        try { buildSiteCityCoordinateIndex(raw, mapping); } catch (e) { console.warn('buildSiteCityCoordinateIndex failed', e); }
+        raw.forEach((row, index) => {
+            customers.push(parseFATRow(row, mapping, index));
+        });
+        if (customers.length > 0) return customers;
+    }
+
+    raw.forEach((row, index) => {
+        const keys = Object.keys(row);
+        const id = normalize(row["ID Customer"] ?? row["lD Customer"] ?? row["Id Customer"] ?? row[keys[0]] ?? "");
+        if (!id) {
+            if (index < 5) console.warn('[CUSTOMER_MAP] fallbackParseCustomerRows missing id on row', index, row);
+            return;
+        }
+        const username = normalize(row["Username"]);
+        const city = normalize(row["City"]);
+        const district = normalize(row["District"]);
+        const ward = normalize(row["Ward"]);
+        const team = normalize(row["Team"]);
+        const vendor = normalize(row["Vendor"] || team);
+        const site = normalize(row["Site Name"] ?? row["CEK SITE NAME SYSTEM"] ?? "");
+        const status = normalize(row["Status Instalasi/Maintenence"] ?? row["Status Instalasi/Maintenance"] ?? "");
+        const visitDate = normalize(row["Visit Date"]);
+        const latKey = keys.find(k => /lat/i.test(k)) || "Latitude";
+        const lonKey = keys.find(k => /lon|lng|long|longitude|x/i.test(k)) || "Longitude";
+        let rawLat = sanitizeNumberString(row[latKey] ?? row["Latitude"] ?? "");
+        let rawLon = sanitizeNumberString(row[lonKey] ?? row["Longitude"] ?? "");
+        let swapped = false;
+        if (Number.isFinite(rawLat) && Number.isFinite(rawLon)){
+            if (Math.abs(rawLat) > 90 && Math.abs(rawLon) <= 90) {
+                const t = rawLat; rawLat = rawLon; rawLon = t; swapped = true;
+            } else if ((rawLat >= 111 && rawLat <= 115) && (rawLon <= -6 && rawLon >= -8)) {
+                const t = rawLat; rawLat = rawLon; rawLon = t; swapped = true;
+            }
+        }
+        let lat = rawLat;
+        let lon = rawLon;
+        if (Number.isFinite(lat) && Math.abs(lat) > 90) lat /= 1000000;
+        if (Number.isFinite(lon) && Math.abs(lon) > 180) lon /= 1000000;
+        if (swapped) {
+            // diagnostic swap fallback
+        }
+        if (!isWithinIndonesiaBounds(lat, lon) || !Number.isFinite(lat) || !Number.isFinite(lon)) {
+            const coord = getCoordinateFromWard(city, district, ward);
+            if (coord) {
+                lat = coord.latitude;
+                lon = coord.longitude;
+            }
+        }
+        customers.push({
+            id,
+            username,
+            city,
+            district,
+            ward,
+            site,
+            team,
+            vendor,
+            status,
+            visitDate,
+            latitude: lat,
+            longitude: lon
+        });
+    });
+    return customers;
+}
+
+function getCoordinateFromWard_old(city, district, ward) {
+
+    const layers = [
+        lyr_surabaya_2,
+        lyr_SIDOARJO_1
+    ];
+
+    city = normalize(city);
+    district = normalize(district);
+    ward = normalize(ward);
+
+    for (const layer of layers) {
+
+        const features =
+            layer.getSource().getFeatures();
+
+        for (const feature of features) {
+
+            const fCity = normalize(feature.get("CITY"));
+
+            const fDistrict = normalize(feature.get("KECAMATAN"));
+
+            const fWard = normalize(feature.get("DESA"));
+
+            if (
+                fCity === city &&
+                fDistrict === district &&
+                fWard === ward
+            ) {
+
+                const center =
+                    ol.extent.getCenter(
+                        feature
+                            .getGeometry()
+                            .getExtent()
+                    );
+
+                const lonlat =
+                    ol.proj.toLonLat(center);
+
+                return {
+
+                    latitude: lonlat[1],
+                    longitude: lonlat[0]
+
+                };
+
+            }
+
+        }
+
+    }
+
+    return null;
+
+}
+
+let wardIndex = new Map();
+let wardFallbackCache = new Map();
+let csvWardCoordinateIndex = new Map();
+
+/* =========================================================
+   WARD POLYGON INDEX (for random point generation)
+   ========================================================= */
+let wardPolygonIndex = new Map(); // key: normalized city||district||ward → array of polygon coordinate rings
+
+function getPolygonCoordinateRings(geometry) {
+    if (!geometry) return [];
+    const rings = [];
+    if (geometry.type === 'Polygon' && Array.isArray(geometry.coordinates)) {
+        for (const ring of geometry.coordinates) {
+            if (Array.isArray(ring) && ring.length >= 3) rings.push(ring);
+        }
+    } else if (geometry.type === 'MultiPolygon' && Array.isArray(geometry.coordinates)) {
+        for (const poly of geometry.coordinates) {
+            if (Array.isArray(poly)) {
+                for (const ring of poly) {
+                    if (Array.isArray(ring) && ring.length >= 3) rings.push(ring);
+                }
+            }
+        }
+    }
+    return rings;
+}
+
+function getOLGeometryRings(geom) {
+    if (!geom) return [];
+    try {
+        if (typeof geom.getCoordinates === 'function') {
+            const coords = geom.getCoordinates();
+            const rings = [];
+            // OpenLayers Polygon: coords = [exteriorRing, ...holes]
+            // OpenLayers MultiPolygon: coords = [ [exteriorRing, ...holes], ... ]
+            const type = geom.getType && geom.getType();
+            if (type === 'Polygon' && Array.isArray(coords) && coords.length >= 1) {
+                for (const ring of coords) {
+                    if (Array.isArray(ring) && ring.length >= 3) {
+                        // transform from EPSG:3857 to EPSG:4326
+                        const lonlatRing = ring.map(c => {
+                            try { const ll = ol.proj.toLonLat(c); return ll; } catch(e) { return c; }
+                        });
+                        rings.push(lonlatRing);
+                    }
+                }
+            } else if (type === 'MultiPolygon' && Array.isArray(coords)) {
+                for (const poly of coords) {
+                    if (Array.isArray(poly)) {
+                        for (const ring of poly) {
+                            if (Array.isArray(ring) && ring.length >= 3) {
+                                const lonlatRing = ring.map(c => {
+                                    try { const ll = ol.proj.toLonLat(c); return ll; } catch(e) { return c; }
+                                });
+                                rings.push(lonlatRing);
+                            }
+                        }
+                    }
+                }
+            }
+            return rings;
+        }
+    } catch(e) {}
+    return [];
+}
+
+function getOLGeometryPolygonRings(geom) {
+    if (!geom || typeof geom.getCoordinates !== 'function') return [];
+    try {
+        const coordinates = geom.getCoordinates();
+        const type = geom.getType && geom.getType();
+        const polygons = type === 'Polygon'
+            ? [coordinates]
+            : type === 'MultiPolygon'
+                ? coordinates
+                : [];
+
+        return polygons
+            .filter(rings => Array.isArray(rings) && rings.length > 0)
+            .map(rings => rings.map(ring =>
+                ring.map(coordinate => ol.proj.toLonLat(coordinate))
+            ));
+    } catch (error) {
+        console.warn('[CUSTOMER_MAP] Failed to index a city boundary polygon:', error);
+        return [];
+    }
+}
+
+// Ray-casting algorithm for point-in-polygon test
+function pointInPolygonLonLat(lon, lat, polygonRing) {
+    if (!Array.isArray(polygonRing) || polygonRing.length < 3) return false;
+    let inside = false;
+    const n = polygonRing.length;
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+        const xi = polygonRing[i][0], yi = polygonRing[i][1];
+        const xj = polygonRing[j][0], yj = polygonRing[j][1];
+        if (((yi > lat) !== (yj > lat)) && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi)) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+function pointInAnyPolygon(lon, lat, rings) {
+    if (!Array.isArray(rings) || rings.length === 0) return false;
+    // First ring is exterior, must be inside
+    if (!pointInPolygonLonLat(lon, lat, rings[0])) return false;
+    // Check holes (subsequent rings) — must NOT be inside any hole
+    for (let h = 1; h < rings.length; h++) {
+        if (pointInPolygonLonLat(lon, lat, rings[h])) return false;
+    }
+    return true;
+}
+
+// Check if a point (lon, lat) is inside any polygon in wardPolygonIndex
+function isPointInAnyWardPolygon(lon, lat) {
+    if (!wardPolygonIndex || wardPolygonIndex.size === 0) return false;
+    for (const [, rings] of wardPolygonIndex.entries()) {
+        if (pointInAnyPolygon(lon, lat, rings)) return true;
+    }
+    return false;
+}
+
+// Generate a random point within a polygon using rejection sampling on bounding box
+function getRandomPointInPolygonRings(rings, maxAttempts) {
+    if (!Array.isArray(rings) || rings.length === 0) return null;
+    const exterior = rings[0];
+    if (!exterior || exterior.length < 3) return null;
+
+    // Compute bounding box of exterior ring
+    let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity;
+    for (const c of exterior) {
+        if (c[0] < minLon) minLon = c[0];
+        if (c[0] > maxLon) maxLon = c[0];
+        if (c[1] < minLat) minLat = c[1];
+        if (c[1] > maxLat) maxLat = c[1];
+    }
+
+    const attempts = maxAttempts || 500;
+    for (let i = 0; i < attempts; i++) {
+        const lon = minLon + Math.random() * (maxLon - minLon);
+        const lat = minLat + Math.random() * (maxLat - minLat);
+        if (pointInAnyPolygon(lon, lat, rings)) {
+            return { longitude: lon, latitude: lat };
+        }
+    }
+    // Fallback: return centroid with small random jitter to avoid exact overlap
+    let sx = 0, sy = 0;
+    for (const c of exterior) { sx += c[0]; sy += c[1]; }
+    const jitterLon = (Math.random() - 0.5) * (maxLon - minLon) * 0.05;
+    const jitterLat = (Math.random() - 0.5) * (maxLat - minLat) * 0.05;
+    return { longitude: sx / exterior.length + jitterLon, latitude: sy / exterior.length + jitterLat };
+}
+
+// Build wardPolygonIndex from OpenLayers polygon layers
+function buildWardPolygonIndex() {
+    wardPolygonIndex.clear();
+    try {
+        const layers = [];
+        if (typeof lyr_surabaya_2 !== 'undefined' && lyr_surabaya_2) layers.push(lyr_surabaya_2);
+        if (typeof lyr_SIDOARJO_1 !== 'undefined' && lyr_SIDOARJO_1) layers.push(lyr_SIDOARJO_1);
+        if (typeof lyr_Denpasar_1 !== 'undefined' && lyr_Denpasar_1) layers.push(lyr_Denpasar_1);
+
+        for (const layer of layers) {
+            try {
+                const features = layer.getSource().getFeatures() || [];
+                for (const feature of features) {
+                    const rawCity = normalize(getFeatureValue(feature, ['CITY','city','City','CITYNAME']));
+                    const rawDistrict = normalize(getFeatureValue(feature, ['KECAMATAN','kecamatan','district','District','DistrictName']));
+                    const rawWard = normalize(getFeatureValue(feature, ['DESA','desa','Ward','WARD','NAMOBJ','name']));
+                    if (!rawWard && !rawDistrict && !rawCity) continue;
+
+                    const geom = feature.getGeometry && feature.getGeometry();
+                    const rings = getOLGeometryRings(geom);
+                    if (rings.length === 0) continue;
+
+                    // Store under multiple key variants for matching (same as getCoordinateFromWard)
+                    const storeKey = (c, d, w) => {
+                        const key = normalizeLocationKey(c, d, w);
+                        if (key && !wardPolygonIndex.has(key)) wardPolygonIndex.set(key, rings);
+                    };
+
+                    const strippedCity = normalize(stripAdminPrefixes(rawCity));
+                    const strippedDistrict = normalize(stripAdminPrefixes(rawDistrict));
+                    const wardShort = normalize(shortWardName(rawWard));
+
+                    const wardNoSpace = normalize((rawWard || '').replace(/\s+/g, ''));
+
+                    storeKey(rawCity, rawDistrict, rawWard);
+                    storeKey(strippedCity, rawDistrict, rawWard);
+                    storeKey(rawCity, strippedDistrict, rawWard);
+                    storeKey(strippedCity, strippedDistrict, rawWard);
+                    storeKey(rawCity, rawDistrict, wardShort);
+                    storeKey(strippedCity, strippedDistrict, wardShort);
+                    // Space-stripped variants (e.g. 'SIWALAN PANJI' → 'siwalanpanji')
+                    storeKey(rawCity, rawDistrict, wardNoSpace);
+                    storeKey(strippedCity, strippedDistrict, wardNoSpace);
+                    storeKey('', rawDistrict, wardNoSpace);
+                    // Cityless variants (for matching when city is empty or missing)
+                    storeKey('', rawDistrict, rawWard);
+                    storeKey('', strippedDistrict, rawWard);
+                    storeKey('', rawDistrict, wardShort);
+                    storeKey('', strippedDistrict, wardShort);
+                }
+            } catch(e) { /* skip layer */ }
+        }
+        console.log('[CUSTOMER_MAP] buildWardPolygonIndex entries=', wardPolygonIndex.size);
+        // Log all BUDURAN ward keys for debugging
+        const buduranKeys = [];
+        for (const [k] of wardPolygonIndex.entries()) {
+            if (k.includes('buduran')) buduranKeys.push(k);
+        }
+        console.log('[WARD_IDX] BUDURAN polygon keys:', buduranKeys.join(' | '));
+    } catch(e) { console.warn('buildWardPolygonIndex error', e); }
+}
+
+// Get random point inside ward polygon boundaries
+function getRandomPointInWard(city, district, ward) {
+    if (wardPolygonIndex.size === 0) buildWardPolygonIndex();
+
+    const nc = normalize(city || '');
+    const nd = normalize(district || '');
+    const nw = normalize(ward || '');
+    const strippedNd = normalize(stripAdminPrefixes(district || ''));
+    const nwShort = normalize(shortWardName(ward || ''));
+
+    const nwNoSpace = normalize((ward || '').replace(/\s+/g, ''));
+
+    // Try multiple key variants (same as getCoordinateFromWard)
+    const candidates = [
+        normalizeLocationKey(nc, nd, nw),
+        normalizeLocationKey(nc, strippedNd, nw),
+        normalizeLocationKey(nc, nd, nwShort),
+        normalizeLocationKey(nc, strippedNd, nwShort),
+        // Space-stripped ward name (e.g. 'SIWALAN PANJI' → 'siwalanpanji')
+        normalizeLocationKey(nc, nd, nwNoSpace),
+        normalizeLocationKey(nc, strippedNd, nwNoSpace),
+        // Cityless variants (for matching when city is empty or missing)
+        normalizeLocationKey('', nd, nw),
+        normalizeLocationKey('', strippedNd, nw),
+        normalizeLocationKey('', nd, nwShort),
+        normalizeLocationKey('', strippedNd, nwShort),
+        normalizeLocationKey('', nd, nwNoSpace),
+        normalizeLocationKey('', strippedNd, nwNoSpace),
+        // District-only variants
+        normalizeLocationKey('', nd, ''),
+        normalizeLocationKey('', strippedNd, ''),
+    ].filter(Boolean);
+
+    for (const key of candidates) {
+        if (wardPolygonIndex.has(key)) {
+            return getRandomPointInPolygonRings(wardPolygonIndex.get(key));
+        }
+    }
+
+    // Fuzzy fallback: try partial ward name match within same district
+    const targetWard = normalizeKey(nw);
+    const targetDistrict = normalizeKey(nd);
+    console.log('[WARD_LOOKUP] ward=' + ward + ' district=' + district + ' NO EXACT MATCH. Candidates tried:', candidates.slice(0, 5).join(', '));
+    for (const [key, rings] of wardPolygonIndex.entries()) {
+        try {
+            const parts = key.split('||').map(p => normalizeKey(p || ''));
+            const kCity = parts[0] || '';
+            const kDistrict = parts[1] || '';
+            const kWard = parts[2] || '';
+            const wardMatch = targetWard && kWard && (kWard.includes(targetWard) || targetWard.includes(kWard));
+            const districtMatch = !targetDistrict || (kDistrict && (kDistrict.includes(targetDistrict) || targetDistrict.includes(kDistrict)));
+            if (wardMatch && districtMatch) {
+                return getRandomPointInPolygonRings(rings);
+            }
+        } catch(e) {}
+    }
+
+    // Final fallback: pick any random polygon from the same district
+    if (targetDistrict) {
+        const sameDistrict = [];
+        for (const [key, rings] of wardPolygonIndex.entries()) {
+            try {
+                const parts = key.split('||').map(p => normalizeKey(p || ''));
+                const kDistrict = parts[1] || '';
+                if (kDistrict && (kDistrict.includes(targetDistrict) || targetDistrict.includes(kDistrict))) {
+                    sameDistrict.push(rings);
+                }
+            } catch(e) {}
+        }
+        if (sameDistrict.length > 0) {
+            const pick = sameDistrict[Math.floor(Math.random() * sameDistrict.length)];
+            return getRandomPointInPolygonRings(pick);
+        }
+    }
+
+    return null;
+}
+
+function compactKey(value) {
+    return normalizeKey(value)
+        .replace(/\s+/g, '');
+}
+
+function normalizeLocationKey(city, district, ward) {
+    return [city, district, ward]
+        .map(value => normalizeKey(value || ""))
+        .join("||");
+}
+
+function normalizeLocationKeyCompact(city, district, ward) {
+    return [city, district, ward]
+        .map(value => String(normalize(value || "")).toLowerCase().replace(/[^a-z0-9]+/g, ''))
+        .join("||");
+}
+
+function buildCsvWardCoordinateIndex(rawRows, mapping = null) {
+    csvWardCoordinateIndex.clear();
+
+    if (!Array.isArray(rawRows) || rawRows.length === 0)
+        return;
+
+    const headerKeys = Object.keys(rawRows[0] || {});
+    const findHeader = aliases => headerKeys.find(key => aliases.includes(normalizeKey(key)));
+    const cityKey = mapping?.city || findHeader(['city']);
+    const districtKey = mapping?.district || findHeader(['district', 'kecamatan', 'kec']);
+    const wardKey = mapping?.ward || findHeader(['ward', 'village', 'desa', 'kelurahan', 'kel']);
+    if (!districtKey && !wardKey) return;
+
+    const defaultLatKey = mapping?.latitude || headerKeys.find(k => /lat/i.test(k)) || "Latitude";
+    const defaultLonKey = mapping?.longitude || headerKeys.find(k => /lon|lng|long|longitude|x/i.test(k)) || "Longitude";
+
+    rawRows.forEach(row => {
+        const city = normalize(cityKey ? row[cityKey] || "" : "");
+        const district = normalize(districtKey ? row[districtKey] || "" : "");
+        const ward = normalize(wardKey ? row[wardKey] || "" : "");
+        const strippedCity = normalize(stripAdminPrefixes(city));
+        const strippedDistrict = normalize(stripAdminPrefixes(district));
+        const wardShort = normalize(shortWardName(ward));
+
+        const latKey = Object.prototype.hasOwnProperty.call(row, defaultLatKey)
+            ? defaultLatKey
+            : (headerKeys.find(k => /lat/i.test(k)) || "Latitude");
+        const lonKey = Object.prototype.hasOwnProperty.call(row, defaultLonKey)
+            ? defaultLonKey
+            : (headerKeys.find(k => /lon|lng|long|longitude|x/i.test(k)) || "Longitude");
+
+        let rawLat = sanitizeNumberString(row[latKey] ?? row["Latitude"] ?? "");
+        let rawLon = sanitizeNumberString(row[lonKey] ?? row["Longitude"] ?? "");
+
+        if (Number.isFinite(rawLat) && Number.isFinite(rawLon)) {
+            if (Math.abs(rawLat) > 90 && Math.abs(rawLon) <= 90) {
+                [rawLat, rawLon] = [rawLon, rawLat];
+            } else if ((rawLat >= 111 && rawLat <= 115) && (rawLon <= -6 && rawLon >= -8)) {
+                [rawLat, rawLon] = [rawLon, rawLat];
+            }
+        }
+
+        let lat = rawLat;
+        let lon = rawLon;
+        if (Number.isFinite(lat) && Math.abs(lat) > 90) lat /= 1000000;
+        if (Number.isFinite(lon) && Math.abs(lon) > 180) lon /= 1000000;
+
+        if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) < 1e-6 || Math.abs(lon) < 1e-6)
+            return;
+
+        const coord = { latitude: lat, longitude: lon };
+        const wardVariants = [ward, normalize(stripAdminPrefixes(ward)), wardShort, ...splitWardVariants(ward)].filter(Boolean);
+        const uniqueWardVariants = [...new Set(wardVariants)];
+        const cityVariants = [city, strippedCity].filter(Boolean);
+        const districtVariants = [district, strippedDistrict].filter(Boolean);
+
+        const addKey = (cityValue, districtValue, wardValue) => {
+            const key = normalizeLocationKey(cityValue, districtValue, wardValue);
+            if (!csvWardCoordinateIndex.has(key)) {
+                csvWardCoordinateIndex.set(key, coord);
+            }
+        };
+
+        const addKeyCompact = (cityValue, districtValue, wardValue) => {
+            const key = normalizeLocationKeyCompact(cityValue, districtValue, wardValue);
+            if (!csvWardCoordinateIndex.has(key)) {
+                csvWardCoordinateIndex.set(key, coord);
+            }
+        };
+
+        const addAllKeys = (cityValue, districtValue, wardValue) => {
+            addKey(cityValue, districtValue, wardValue);
+            addKeyCompact(cityValue, districtValue, wardValue);
+        };
+
+        if (uniqueWardVariants.length === 0) {
+            cityVariants.forEach(cityVariant => {
+                if (districtVariants.length > 0) {
+                    districtVariants.forEach(districtVariant => {
+                        addAllKeys(cityVariant, districtVariant, "");
+                        addAllKeys(cityVariant, "", "");
+                        addAllKeys("", districtVariant, "");
+                    });
+                } else {
+                    addAllKeys(cityVariant, "", "");
+                }
+            });
+            districtVariants.forEach(districtVariant => addAllKeys("", districtVariant, ""));
+            addAllKeys("", "", "");
+            return;
+        }
+
+        uniqueWardVariants.forEach(wardVariant => {
+            cityVariants.forEach(cityVariant => {
+                if (districtVariants.length > 0) {
+                    districtVariants.forEach(districtVariant => {
+                        addAllKeys(cityVariant, districtVariant, wardVariant);
+                        addAllKeys(cityVariant, districtVariant, "");
+                        addAllKeys(cityVariant, "", wardVariant);
+                        addAllKeys("", districtVariant, wardVariant);
+                    });
+                } else {
+                    addAllKeys(cityVariant, "", wardVariant);
+                    addAllKeys(cityVariant, "", "");
+                }
+            });
+            if (districtVariants.length > 0) {
+                districtVariants.forEach(districtVariant => {
+                    addAllKeys("", districtVariant, wardVariant);
+                    addAllKeys("", districtVariant, "");
+                });
+            }
+            addAllKeys("", "", wardVariant);
+            addAllKeys("", "", "");
+        });
+    });
+}
+
+function getCoordinateFromCsvWard(city, district, ward) {
+    if (csvWardCoordinateIndex.size === 0)
+        return null;
+
+    const normalizedCity = normalize(city || "");
+    const normalizedDistrict = normalize(district || "");
+    const strippedCity = normalize(stripAdminPrefixes(normalizedCity));
+    const strippedDistrict = normalize(stripAdminPrefixes(normalizedDistrict));
+    const cityVariants = [normalizedCity, strippedCity].filter(Boolean);
+    const districtVariants = [normalizedDistrict, strippedDistrict].filter(Boolean);
+
+    const wardVariants = [
+        normalize(ward),
+        normalize(stripAdminPrefixes(ward)),
+        normalize(shortWardName(ward)),
+        ...splitWardVariants(ward)
+    ].filter(Boolean);
+
+    const candidateKeys = new Set();
+
+    if (wardVariants.length === 0) {
+        cityVariants.forEach(cityVariant => {
+            if (districtVariants.length > 0) {
+                districtVariants.forEach(districtVariant => {
+                    candidateKeys.add(normalizeLocationKey(cityVariant, districtVariant, ""));
+                    candidateKeys.add(normalizeLocationKeyCompact(cityVariant, districtVariant, ""));
+                    candidateKeys.add(normalizeLocationKey(cityVariant, "", ""));
+                    candidateKeys.add(normalizeLocationKeyCompact(cityVariant, "", ""));
+                    candidateKeys.add(normalizeLocationKey("", districtVariant, ""));
+                    candidateKeys.add(normalizeLocationKeyCompact("", districtVariant, ""));
+                });
+            } else {
+                candidateKeys.add(normalizeLocationKey(cityVariant, "", ""));
+                candidateKeys.add(normalizeLocationKeyCompact(cityVariant, "", ""));
+            }
+        });
+
+        districtVariants.forEach(districtVariant => {
+            candidateKeys.add(normalizeLocationKey("", districtVariant, ""));
+            candidateKeys.add(normalizeLocationKeyCompact("", districtVariant, ""));
+        });
+    }
+
+    wardVariants.forEach(wardVariant => {
+        if (cityVariants.length > 0) {
+            cityVariants.forEach(cityVariant => {
+                if (districtVariants.length > 0) {
+                    districtVariants.forEach(districtVariant => {
+                        candidateKeys.add(normalizeLocationKey(cityVariant, districtVariant, wardVariant));
+                        candidateKeys.add(normalizeLocationKeyCompact(cityVariant, districtVariant, wardVariant));
+                        candidateKeys.add(normalizeLocationKey(cityVariant, districtVariant, ""));
+                        candidateKeys.add(normalizeLocationKeyCompact(cityVariant, districtVariant, ""));
+                        candidateKeys.add(normalizeLocationKey(cityVariant, "", wardVariant));
+                        candidateKeys.add(normalizeLocationKeyCompact(cityVariant, "", wardVariant));
+                        candidateKeys.add(normalizeLocationKey("", districtVariant, wardVariant));
+                        candidateKeys.add(normalizeLocationKeyCompact("", districtVariant, wardVariant));
+                    });
+                } else {
+                    candidateKeys.add(normalizeLocationKey(cityVariant, "", wardVariant));
+                    candidateKeys.add(normalizeLocationKeyCompact(cityVariant, "", wardVariant));
+                    candidateKeys.add(normalizeLocationKey(cityVariant, "", ""));
+                    candidateKeys.add(normalizeLocationKeyCompact(cityVariant, "", ""));
+                }
+            });
+        }
+
+        if (cityVariants.length === 0 && districtVariants.length > 0) {
+            districtVariants.forEach(districtVariant => {
+                candidateKeys.add(normalizeLocationKey("", districtVariant, wardVariant));
+                candidateKeys.add(normalizeLocationKeyCompact("", districtVariant, wardVariant));
+                candidateKeys.add(normalizeLocationKey("", districtVariant, ""));
+                candidateKeys.add(normalizeLocationKeyCompact("", districtVariant, ""));
+            });
+        }
+
+        candidateKeys.add(normalizeLocationKey("", "", wardVariant));
+        candidateKeys.add(normalizeLocationKeyCompact("", "", wardVariant));
+    });
+
+    for (const key of candidateKeys) {
+        if (csvWardCoordinateIndex.has(key))
+            return csvWardCoordinateIndex.get(key);
+    }
+
+    // Loose fallback using partial ward/district matches to recover misspellings or alternate naming conventions.
+    const targetWard = normalizeKey(ward);
+    const targetDistrict = normalizeKey(district);
+    const targetCity = normalizeKey(city);
+
+    if (targetWard || targetDistrict || targetCity) {
+        for (const [key, coord] of csvWardCoordinateIndex.entries()) {
+            const [cityKey, distKey, wardKey] = key.split('||').map(part => normalizeKey(part || ''));
+            const wardMatch = targetWard && wardKey && (wardKey.includes(targetWard) || targetWard.includes(wardKey));
+            const districtMatch = !targetDistrict || (distKey && (distKey.includes(targetDistrict) || targetDistrict.includes(distKey)));
+            const cityMatch = !targetCity || (cityKey && (cityKey.includes(targetCity) || targetCity.includes(cityKey)));
+            if ((wardMatch || (!targetWard && distKey && districtMatch)) && districtMatch && cityMatch) {
+                return coord;
+            }
+        }
+    }
+
+    return null;
+}
+
+function getCoordinateFromCity(city) {
+    const normalizedCity = normalize(city).toLowerCase();
+    const cityFallbacks = {
+        "kota surabaya": { latitude: -7.257472, longitude: 112.752088 },
+        "surabaya": { latitude: -7.257472, longitude: 112.752088 },
+        "kab. sidoarjo": { latitude: -7.4485, longitude: 112.7152 },
+        "sidoarjo": { latitude: -7.4485, longitude: 112.7152 },
+        "kota denpasar": { latitude: -8.6500, longitude: 115.2167 },
+        "denpasar": { latitude: -8.6500, longitude: 115.2167 }
+    };
+    return cityFallbacks[normalizedCity] || null;
+}
+
+function stripAdminPrefixes(s){
+    return s.replace(/^kab(\.|upaten)?\s+/i, '')
+            .replace(/^kota\s+/i, '')
+            .replace(/^kabupaten\s+/i, '')
+            .replace(/^provinsi\s+/i, '')
+            .replace(/["'\.]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+}
+
+function shortWardName(s){
+    // remove RW/RT suffixes, common local prefixes, and content in parentheses
+    return s.replace(/^\s*(desa|kelurahan)\s+/i, '')
+            .replace(/\bRW\b.*$/i, '')
+            .replace(/\bRT\b.*$/i, '')
+            .replace(/\(.*\)/g, '')
+            .replace(/[\.,]+/g, '.')
+            .replace(/\s+/g, ' ')
+            .trim();
+}
+
+function splitWardVariants(raw){
+    const s = String(raw || '').trim();
+    if (!s) return [];
+    const parts = s.split(/[|\/]+/).map(p => normalize(p)).filter(Boolean);
+    return [...new Set(parts)];
+}
+
+function getFeatureValue(feature, keys){
+    const normalizedLookup = new Set(
+        keys
+            .map(key => normalize(String(key)).toLowerCase())
+            .filter(Boolean)
+    );
+
+    if (typeof feature.getKeys === 'function') {
+        const keysList = feature.getKeys();
+        for (const key of keysList) {
+            if (!normalizedLookup.has(normalize(String(key)).toLowerCase()))
+                continue;
+            const value = feature.get(key);
+            if (value !== undefined && value !== null && String(value).trim() !== '') {
+                return String(value);
+            }
+        }
+    }
+
+    for (const key of keys) {
+        const value = feature.get(key);
+        if (value !== undefined && value !== null && String(value).trim() !== '') {
+            return String(value);
+        }
+    }
+
+    return '';
+}
+
+function addWardKey(key, coord){
+    const normalizedKey = normalizeKey(key);
+    if (!wardIndex.has(normalizedKey)) wardIndex.set(normalizedKey, coord);
+    const normalizedCompact = compactKey(key);
+    if (normalizedCompact && !wardIndex.has(normalizedCompact)) wardIndex.set(normalizedCompact, coord);
+}
+function buildWardIndex(){
+
+    try{
+        wardIndex.clear();
+        wardFallbackCache.clear();
+        const layerPairs = [
+            {layerVar: (typeof lyr_surabaya_2 !== 'undefined' ? lyr_surabaya_2 : null), jsonVarName: 'json_surabaya_2'},
+                {layerVar: (typeof lyr_SIDOARJO_1 !== 'undefined' ? lyr_SIDOARJO_1 : null), jsonVarName: 'json_SIDOARJO_1'},
+                {layerVar: (typeof lyr_Denpasar_1 !== 'undefined' ? lyr_Denpasar_1 : null), jsonVarName: 'json_Denpasar_1'
+}
+        ];
+
+        layerPairs.forEach(pair => {
+            const layer = pair.layerVar;
+
+            // If we have an OpenLayers layer object, use its features
+            if (layer && layer.getSource && typeof layer.getSource().getFeatures === 'function') {
+                const features = layer.getSource().getFeatures() || [];
+                features.forEach(feature => {
+                    const rawCity = normalize(getFeatureValue(feature, ['CITY','city','City','CITYNAME']));
+                    const rawDistrict = normalize(getFeatureValue(feature, ['KECAMATAN','kecamatan','district','District','DistrictName']));
+                    const rawWard = normalize(getFeatureValue(feature, ['DESA','desa','Ward','WARD','NAMOBJ','name']));
+                    const strippedCity = normalize(stripAdminPrefixes(rawCity));
+                    const strippedDistrict = normalize(stripAdminPrefixes(rawDistrict));
+                    const wardShort = normalize(shortWardName(rawWard));
+                    try {
+                        const coord = getFeatureInteriorCoordinate(feature) || (() => {
+                            const center = ol.extent.getCenter(feature.getGeometry().getExtent());
+                            const lonlat = ol.proj.toLonLat(center);
+                            return { latitude: lonlat[1], longitude: lonlat[0] };
+                        })();
+                        const wardNoSpace = normalize((rawWard || '').replace(/\s+/g, ''));
+                        addWardKey(`${rawCity}||${rawDistrict}||${rawWard}`, coord);
+                        addWardKey(`${strippedCity}||${rawDistrict}||${rawWard}`, coord);
+                        addWardKey(`${rawCity}||${strippedDistrict}||${rawWard}`, coord);
+                        addWardKey(`${strippedCity}||${strippedDistrict}||${rawWard}`, coord);
+                        addWardKey(`${rawCity}||${rawDistrict}||${wardShort}`, coord);
+                        addWardKey(`${strippedCity}||${strippedDistrict}||${wardShort}`, coord);
+                        addWardKey(`${rawCity}||${rawDistrict}||${wardNoSpace}`, coord);
+                        addWardKey(`${strippedCity}||${strippedDistrict}||${wardNoSpace}`, coord);
+                        addWardKey(`${rawCity}||${rawDistrict}||`, coord);
+                        addWardKey(`${strippedCity}||${rawDistrict}||`, coord);
+                        addWardKey(`${rawCity}||${strippedDistrict}||`, coord);
+                        addWardKey(`${strippedCity}||${strippedDistrict}||`, coord);
+                        addWardKey(`${rawCity}|||`, coord);
+                        addWardKey(`${strippedCity}|||`, coord);
+                        addWardKey(`||${rawDistrict}||`, coord);
+                        addWardKey(`||${strippedDistrict}||`, coord);
+                        addWardKey(`||${rawDistrict}||${rawWard}`, coord);
+                        addWardKey(`||${rawDistrict}||${wardShort}`, coord);
+                        addWardKey(`||${strippedDistrict}||${wardShort}`, coord);
+                        addWardKey(`||${rawDistrict}||${wardNoSpace}`, coord);
+                        addWardKey(`||${strippedDistrict}||${wardNoSpace}`, coord);
+                        addWardKey(`||${rawWard}`, coord);
+                        addWardKey(`||${wardShort}`, coord);
+                    } catch (e) { /* ignore per-feature errors */ }
+                });
+                return; // continue to next pair
+            }
+
+            // Otherwise try to read the JSON variable embedded in the page
+            try {
+                const jsonVar = (typeof window !== 'undefined' ? window[pair.jsonVarName] : undefined) || (typeof globalThis !== 'undefined' ? globalThis[pair.jsonVarName] : undefined);
+                if (jsonVar && Array.isArray(jsonVar.features)) {
+                    jsonVar.features.forEach(f => {
+                        const props = f.properties || {};
+                        const rawCity = normalize(String(props.CITY || props.city || ''));
+                        const rawDistrict = normalize(String(props.KECAMATAN || props.kecamatan || props.DISTRICT || props.district || ''));
+                        const rawWard = normalize(String(props.DESA || props.desa || props.WARD || props.Ward || props.NAMOBJ || props.name || ''));
+                        const strippedCity = normalize(stripAdminPrefixes(rawCity));
+                        const strippedDistrict = normalize(stripAdminPrefixes(rawDistrict));
+                        const wardShort = normalize(shortWardName(rawWard));
+                        try {
+                            let coords = null;
+                            if (f.geometry && f.geometry.type === 'Polygon' && Array.isArray(f.geometry.coordinates) && f.geometry.coordinates[0]) coords = f.geometry.coordinates[0];
+                            else if (f.geometry && f.geometry.type === 'MultiPolygon' && Array.isArray(f.geometry.coordinates) && f.geometry.coordinates[0] && f.geometry.coordinates[0][0]) coords = f.geometry.coordinates[0][0];
+                            if (coords && coords.length) {
+                                let sx = 0, sy = 0, n = 0;
+                                for (const c of coords) {
+                                    if (!Array.isArray(c) || c.length < 2) continue;
+                                    const x = Number(c[0]), y = Number(c[1]);
+                                    if (!isFinite(x) || !isFinite(y)) continue;
+                                    sx += x; sy += y; n++;
+                                }
+                                if (n > 0) {
+                                    let average = [sx / n, sy / n];
+                                    const maybe = maybeLonLat(average);
+                                    if (maybe) {
+                                        const coord = { latitude: maybe.latitude, longitude: maybe.longitude };
+                                        addWardKey(`${rawCity}||${rawDistrict}||${rawWard}`, coord);
+                                        addWardKey(`${strippedCity}||${rawDistrict}||${rawWard}`, coord);
+                                        addWardKey(`${rawCity}||${strippedDistrict}||${rawWard}`, coord);
+                                        addWardKey(`${strippedCity}||${strippedDistrict}||${rawWard}`, coord);
+                                        addWardKey(`${rawCity}||${rawDistrict}||${wardShort}`, coord);
+                                        addWardKey(`${strippedCity}||${strippedDistrict}||${wardShort}`, coord);
+                                        addWardKey(`${rawCity}||${rawDistrict}||`, coord);
+                                        addWardKey(`${strippedCity}||${rawDistrict}||`, coord);
+                                        addWardKey(`${rawCity}||${strippedDistrict}||`, coord);
+                                        addWardKey(`${strippedCity}||${strippedDistrict}||`, coord);
+                                        addWardKey(`${rawCity}|||`, coord);
+                                        addWardKey(`${strippedCity}|||`, coord);
+                                        addWardKey(`||${rawDistrict}||`, coord);
+                                        addWardKey(`||${strippedDistrict}||`, coord);
+                                        addWardKey(`||${rawDistrict}||${rawWard}`, coord);
+                                        addWardKey(`||${rawDistrict}||${wardShort}`, coord);
+                                        addWardKey(`||${strippedDistrict}||${wardShort}`, coord);
+                                        addWardKey(`||${rawWard}`, coord);
+                                        addWardKey(`||${wardShort}`, coord);
+                                    }
+                                }
+                            }
+                        } catch (e) { /* ignore */ }
+                    });
+                    return;
+                }
+            } catch (e) { /* ignore */ }
+
+        });
+
+    } catch (e) {
+        console.error('buildWardIndex error', e);
+    }
+
+}
+
+function getCoordinateFromWard(city, district, ward){
+    if (wardIndex.size === 0) buildWardIndex();
+    const nc_raw = String(city || '');
+    const nd_raw = String(district || '');
+    const nw_raw = String(ward || '');
+    const nc = normalize(nc_raw);
+    const nd = normalize(nd_raw);
+    const nw = normalize(nw_raw);
+    const nw_stripped = normalize(stripAdminPrefixes(nw_raw));
+    const nw_short = normalize(shortWardName(nw_raw));
+    const cacheKey = `${nc}||${nd}||${nw}`;
+
+    if (wardFallbackCache.has(cacheKey)) {
+        return wardFallbackCache.get(cacheKey);
+    }
+
+    const addCandidate = (arr, item) => {
+        if (!item) return;
+        const normalized = normalizeKey(item);
+        if (normalized && !arr.includes(normalized)) arr.push(normalized);
+    };
+
+    const nw_noSpace = normalize((nw_raw || '').replace(/\s+/g, ''));
+    const possibleWardParts = [nw, nw_stripped, nw_short, nw_noSpace, ...splitWardVariants(nw_raw)];
+    const wardVariants = [...new Set(possibleWardParts.filter(Boolean))];
+
+    const candidates = [];
+    for (const wardVariant of wardVariants) {
+        addCandidate(candidates, `${nc}||${nd}||${wardVariant}`);
+        addCandidate(candidates, `${stripAdminPrefixes(nc)}||${nd}||${wardVariant}`);
+        addCandidate(candidates, `${nc}||${stripAdminPrefixes(nd)}||${wardVariant}`);
+        addCandidate(candidates, `${stripAdminPrefixes(nc)}||${stripAdminPrefixes(nd)}||${wardVariant}`);
+        addCandidate(candidates, `${nc}||${nd}||${normalize(stripAdminPrefixes(wardVariant))}`);
+        addCandidate(candidates, `${nc}||${nd}||${normalize(shortWardName(wardVariant))}`);
+        addCandidate(candidates, `${nc}||${nd}||`);
+        addCandidate(candidates, `${stripAdminPrefixes(nc)}||${nd}||`);
+        addCandidate(candidates, `${nc}||${stripAdminPrefixes(nd)}||`);
+        addCandidate(candidates, `${stripAdminPrefixes(nc)}||${stripAdminPrefixes(nd)}||`);
+        addCandidate(candidates, `${nc}|||`);
+        addCandidate(candidates, `${stripAdminPrefixes(nc)}|||`);
+        addCandidate(candidates, `||${stripAdminPrefixes(nd)}||${wardVariant}`);
+        addCandidate(candidates, `||${stripAdminPrefixes(nd)}||${normalize(stripAdminPrefixes(wardVariant))}`);
+        addCandidate(candidates, `||${stripAdminPrefixes(nd)}||${normalize(shortWardName(wardVariant))}`);
+        addCandidate(candidates, `||${nd}||${wardVariant}`);
+        addCandidate(candidates, `||${nd}||`);
+        addCandidate(candidates, `||${wardVariant}`);
+        addCandidate(candidates, `||${normalize(shortWardName(wardVariant))}`);
+    }
+
+    if (wardVariants.length === 0) {
+        addCandidate(candidates, `${nc}||${nd}||`);
+        addCandidate(candidates, `${stripAdminPrefixes(nc)}||${nd}||`);
+        addCandidate(candidates, `${nc}||${stripAdminPrefixes(nd)}||`);
+        addCandidate(candidates, `${stripAdminPrefixes(nc)}||${stripAdminPrefixes(nd)}||`);
+        addCandidate(candidates, `${nc}|||`);
+        addCandidate(candidates, `${stripAdminPrefixes(nc)}|||`);
+        addCandidate(candidates, `||${nd}||`);
+        addCandidate(candidates, `||${stripAdminPrefixes(nd)}||`);
+    }
+
+    for (const k of candidates) {
+        if (wardIndex.has(k)) {
+            const c = Object.assign({matchedKey: k}, wardIndex.get(k));
+            wardFallbackCache.set(cacheKey, c);
+            return c;
+        }
+    }
+
+    // If exact ward lookup fails, try compact no-space variants
+    for (const k of candidates) {
+        const compact = k.replace(/\s+/g, '');
+        if (wardIndex.has(compact)) {
+            const c = Object.assign({matchedKey: compact}, wardIndex.get(compact));
+            wardFallbackCache.set(cacheKey, c);
+            return c;
+        }
+    }
+
+    const alnum = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    const targetWard = alnum(nw);
+    const targetDistrict = alnum(nd);
+    const targetCity = alnum(nc);
+
+    if (targetWard || targetDistrict || targetCity) {
+        for (const [k, v] of wardIndex.entries()) {
+            try {
+                const parts = k.split('||');
+                const kCity = alnum(parts[0] || '');
+                const kDistrict = alnum(parts[1] || '');
+                const kWard = alnum(parts[2] || '');
+
+                const wardMatch = targetWard && kWard && (kWard.includes(targetWard) || targetWard.includes(kWard));
+                const districtMatch = !targetDistrict || (kDistrict && (kDistrict.includes(targetDistrict) || targetDistrict.includes(kDistrict)));
+                const cityMatch = !targetCity || (kCity && (kCity.includes(targetCity) || targetCity.includes(kCity)));
+
+                if (wardMatch && districtMatch && cityMatch) {
+                    const c = Object.assign({matchedKey: k}, v);
+                    wardFallbackCache.set(cacheKey, c);
+                    return c;
+                }
+            } catch (e) { }
+        }
+    }
+
+    // fallback: if we have a district or city but not ward specifics, try any matching district or city
+    if (targetDistrict || targetCity) {
+        for (const [k, v] of wardIndex.entries()) {
+            try {
+                const parts = k.split('||');
+                const kCity = alnum(parts[0] || '');
+                const kDistrict = alnum(parts[1] || '');
+                const cityMatch = !targetCity || (kCity && (kCity.includes(targetCity) || targetCity.includes(kCity)));
+                const districtMatch = !targetDistrict || (kDistrict && (kDistrict.includes(targetDistrict) || targetDistrict.includes(kDistrict)));
+                if (cityMatch && districtMatch) {
+                    const c = Object.assign({matchedKey: k}, v);
+                    wardFallbackCache.set(cacheKey, c);
+                    return c;
+                }
+            } catch (e) { }
+        }
+    }
+
+    wardFallbackCache.set(cacheKey, null);
+    return null;
+}
+
+// Snap a customer record to the ward/district polygon centroid (if available)
+function snapCustomerToWard(customer) {
+    try {
+        if (!customer || typeof customer !== 'object') return customer;
+        // Skip snapping if customer already has a random position set
+        if (customer.__useRandomPosition) return customer;
+        const city = customer.city || '';
+        const district = customer.district || '';
+        const ward = customer.ward || '';
+        if (!city && !district && !ward) return customer;
+        // Skip snapping if customer already has valid coordinates (not 0,0)
+        const curLat = Number(customer.latitude) || 0;
+        const curLon = Number(customer.longitude) || 0;
+        const curHasDecimals = (String(curLat).split('.')[1] || '').length >= 2 && (String(curLon).split('.')[1] || '').length >= 2;
+        if (Number.isFinite(curLat) && Number.isFinite(curLon) && Math.abs(curLat) > 0.1 && Math.abs(curLon) > 100 && curLat >= -9.5 && curLat <= -6.0 && curLon >= 111.0 && curLon <= 116.5 && curHasDecimals) {
+            return customer;
+        }
+        // Prefer polygon-derived ward index (authoritative), then CSV-provided ward coords
+        let coord = null;
+        coord = getCoordinateFromWard(city, district, ward) || getCoordinateFromCsvWard(city, district, ward);
+        if (coord && coord.latitude != null && coord.longitude != null) {
+            const out = Object.assign({}, customer);
+            out.latitude = coord.latitude;
+            out.longitude = coord.longitude;
+            // Preserve original resolvedBy info but indicate snapping
+            const prev = String(customer.resolvedBy || 'original');
+            out.resolvedBy = prev + '|wardSnap';
+            return out;
+        }
+    } catch (e) { /* ignore */ }
+    return customer;
+}
+
+/* =========================================================
+   PARSE CUSTOMER DATA
+   ========================================================= */
+
+function hasValidCustomerCoordinates(customer) {
+    if (!customer || typeof customer !== 'object') return false;
+    const lat = Number(customer.latitude);
+    const lon = Number(customer.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+    if (Math.abs(lat) < 1e-6 || Math.abs(lon) < 1e-6) return false;
+    if (!isWithinIndonesiaBounds(lat, lon)) return false;
+    const latDecimals = (String(customer.latitude).split('.')[1] || '').length;
+    const lonDecimals = (String(customer.longitude).split('.')[1] || '').length;
+    return latDecimals >= 2 && lonDecimals >= 2;
+}
+
+function parseCustomerData(rowsOrText){
+
+    const raw = Array.isArray(rowsOrText) ? rowsOrText : parseCSV(rowsOrText);
+    console.log('[CUSTOMER_MAP] parseCustomerData raw rows=', raw.length);
+
+    if(raw.length===0) return [];
+
+    const mapping = resolveFATHeaders(raw);
+    if (!mapping || (!mapping.label && !mapping.site && !mapping.city && !mapping.id)) {
+        console.error('[CUSTOMER_MAP] Tidak ada kolom dikenali di dataset. Header tersedia:', Object.keys(raw[0] || {}));
+        return [];
+    }
+    try { buildCsvWardCoordinateIndex(raw, mapping); } catch (e) { console.warn('buildCsvWardCoordinateIndex (FAT mode) failed', e); }
+    try {
+        if (cityBoundaryIndex.size === 0) buildCityBoundaryIndex();
+        buildSiteCoordinateIndex(raw, mapping);
+        try { buildSiteCityCoordinateIndex(raw, mapping); } catch (e) { console.warn('buildSiteCityCoordinateIndex failed', e); }
+    } catch (e) {
+        console.warn('buildSiteCoordinateIndex failed', e);
+    }
+
+    const customers = [];
+
+    let wardResolvedCount = 0;
+    let defaultedCount = 0;
+
+    for (let index = 0; index < raw.length; index++) {
+        const row = raw[index];
+        const customer = parseFATRow(row, mapping, index);
+        if (!customer.label && !customer.site && !customer.id) continue;
+
+        if (customer.resolvedBy === 'wardIndex') wardResolvedCount++;
+        else if (customer.resolvedBy === 'default') defaultedCount++;
+
+        // Snap to ward centroid (if available) so markers follow ward/district polygons
+        const finalCustomer = snapCustomerToWard(customer);
+        customers.push(finalCustomer);
+    }
+
+    console.log('parseCustomerData: totalRaw=', raw.length,
+        'customersParsed=', customers.length,
+        'wardResolved=', wardResolvedCount,
+        'defaulted=', defaultedCount);
+
+    return customers;
+
+}
+
+
+/* =========================================================
+   MARKER STYLE
+   ========================================================= */
+
+// Use a Web Worker to parse large CSVs in background and return the parsed customers
+function parseCustomerDataWithWorker(text, wardIndexEntries, options = {}) {
+    return new Promise((resolve, reject) => {
+        try {
+            // Create worker relative to current script location
+            const worker = new Worker('resources/customer-parser-worker.js');
+            const timeout = options.timeout || 120000; // safety timeout
+            let timedOut = false;
+            const to = setTimeout(() => {
+                timedOut = true;
+                try { worker.terminate(); } catch (e) {}
+                reject(new Error('customer-parser-worker timed out')); }, timeout);
+
+            const onMessage = (ev) => {
+                const d = ev.data || {};
+                if (d.cmd === 'done') {
+                    clearTimeout(to);
+                    worker.removeEventListener('message', onMessage);
+                    try { worker.terminate(); } catch (e) {}
+                    resolve(d.customers || []);
+                } else if (d.cmd === 'error') {
+                    clearTimeout(to);
+                    worker.removeEventListener('message', onMessage);
+                    try { worker.terminate(); } catch (e) {}
+                    reject(new Error(d.message || 'worker error'));
+                }
+            };
+
+            worker.addEventListener('message', onMessage);
+            worker.addEventListener('error', (err) => {
+                clearTimeout(to);
+                worker.removeEventListener('message', onMessage);
+                try { worker.terminate(); } catch (e) {}
+                reject(err || new Error('worker runtime error'));
+            });
+
+            // Send serialized wardIndex entries so worker can use wardIndex lookups
+            const payload = { cmd: 'parse', text: text, wardIndexEntries: wardIndexEntries || [], options };
+            worker.postMessage(payload);
+        } catch (err) {
+            reject(err);
+        }
+    });
+}
+
+/* Async chunked parser to avoid long main-thread blocks when parsing large CSVs.
+   Options: { chunkSize: number }
+*/
+function parseCustomerDataAsync(text, options = {}) {
+    const chunkSize = options.chunkSize || 1000;
+    return new Promise((resolve, reject) => {
+        try {
+            const raw = Array.isArray(text) ? text : parseCSV(text);
+            console.log('[CUSTOMER_MAP] parseCustomerDataAsync raw rows=', raw.length);
+            if (!Array.isArray(raw) || raw.length === 0) return resolve([]);
+
+            const setupStart = performance.now();
+            const mapping = resolveFATHeaders(raw);
+            if (!mapping || (!mapping.label && !mapping.site && !mapping.city && !mapping.id)) {
+                console.error('[CUSTOMER_MAP] parseCustomerDataAsync: header tidak dikenali');
+                return resolve([]);
+            }
+            // A ward coordinate fallback needs district or ward columns.
+            try { buildCsvWardCoordinateIndex(raw, mapping); } catch (e) { console.warn('buildCsvWardCoordinateIndex (FAT mode) failed', e); }
+            try {
+                if (cityBoundaryIndex.size === 0) buildCityBoundaryIndex();
+                buildSiteCoordinateIndex(raw, mapping);
+                try { buildSiteCityCoordinateIndex(raw, mapping); } catch (e) { console.warn('buildSiteCityCoordinateIndex failed', e); }
+            } catch (e) {
+                console.warn('buildSiteCoordinateIndex failed', e);
+            }
+            const setupMs = Math.round(performance.now() - setupStart);
+
+            const customers = [];
+
+            let wardResolvedCount = 0;
+            let defaultedCount = 0;
+
+            let i = 0;
+            const N = raw.length;
+
+            const processChunk = () => {
+                const end = Math.min(i + chunkSize, N);
+                for (; i < end; i++) {
+                    const row = raw[i];
+                    const customer = parseFATRow(row, mapping, i);
+                    if (!customer.label && !customer.site && !customer.id) continue;
+
+                    if (customer.resolvedBy === 'wardIndex') wardResolvedCount++;
+                    else if (customer.resolvedBy === 'default') defaultedCount++;
+
+                    customers.push(customer);
+                }
+
+                if (i < N) {
+                    if (typeof options.onProgress === 'function') options.onProgress(i, N);
+                    // yield to event loop
+                    setTimeout(processChunk, 0);
+                } else {
+                    // done
+                    console.log('parseCustomerDataAsync: totalRaw=', raw.length,
+                        'customersParsed=', customers.length,
+                        'wardResolved=', wardResolvedCount,
+                        'defaulted=', defaultedCount,
+                        'setupMs=', setupMs,
+                        'rowParseMs=', Math.round(performance.now() - setupStart - setupMs));
+                    if (typeof options.onProgress === 'function') options.onProgress(N, N);
+                    resolve(customers);
+                }
+            };
+
+            processChunk();
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+/* =========================================================
+   MARKER STYLE
+   ========================================================= */
+
+function createMarkerStyle(customer) {
+
+    if (typeof DEBUG_HIGHLIGHT_MARKERS !== 'undefined' && DEBUG_HIGHLIGHT_MARKERS) {
+        // High-visibility debug style
+        return new ol.style.Style({
+            image: new ol.style.Circle({
+                radius: 12,
+                fill: new ol.style.Fill({ color: 'rgba(220,20,60,0.95)' }), // crimson
+                stroke: new ol.style.Stroke({ color: '#000000', width: 2 })
+            })
+        });
+    }
+
+    // Bentuk & warna marker mengikuti symbol Status FAT
+    const fatConfig = getFATSymbolConfig(customer);
+
+    return new ol.style.Style({
+
+        image: createFATSymbolImage(fatConfig, 7)
+
+    });
+
+}
+
+/* =========================================================
+   CREATE MAP LAYER
+   ========================================================= */
+
+function createCustomerLayer() {
+
+    // Avoid recreating layer if it already exists (prevents other scripts from wiping it)
+    if (customerLayer && customerSource) {
+        try { if (typeof customerLayer.setZIndex === 'function') customerLayer.setZIndex(99999); } catch(e){}
+        try {
+            if (typeof map !== 'undefined' && map && typeof map.getLayers === 'function') {
+                const layers = map.getLayers().getArray();
+                if (!layers.includes(customerLayer)) {
+                    map.addLayer(customerLayer);
+                }
+                // ensure expanded layer exists and is added
+                if (!customerExpandedLayer && typeof ol !== 'undefined') {
+                    try {
+                        customerExpandedSource = new ol.source.Vector();
+                        customerExpandedLayer = new ol.layer.Vector({ source: customerExpandedSource, renderMode: 'vector', declutter: false, style: (feature) => customerLayer.getStyle()(feature) });
+                        map.addLayer(customerExpandedLayer);
+                        try { if (typeof customerExpandedLayer.setZIndex === 'function') customerExpandedLayer.setZIndex(100000); } catch(e){}
+                    } catch (e) { /* ignore */ }
+                } else if (customerExpandedLayer && !layers.includes(customerExpandedLayer)) {
+                    try { map.addLayer(customerExpandedLayer); } catch(e){}
+                }
+            }
+        } catch (e) {
+            console.warn('createCustomerLayer: failed to re-add existing customer layer', e);
+        }
+        return;
+    }
+
+    // remove any stale customer layers remaining from previous script reloads
+    try {
+        removeStaleCustomerLayers();
+    } catch (e) {
+        console.warn('createCustomerLayer: failed to cleanup existing customer layers', e);
+    }
+
+    customerSource = new ol.source.Vector();
+
+    // Shared style cache and style function to avoid creating one style per feature (big perf win)
+    if (!window._customer_style_cache) window._customer_style_cache = {};
+    const customerStyleFunction = function(feature) {
+        const customer = feature.get('customer') || {};
+        // Bentuk & warna marker mengikuti symbol Status FAT (📗📕=segitiga, 🟢🔴🟠🟤⚫=lingkaran)
+        const key = getFATSymbolKey(customer);
+        const cacheKey = 'fatSymbol:' + key;
+        if (window._customer_style_cache[cacheKey]) return window._customer_style_cache[cacheKey];
+        // Create a single shared style per symbol
+        const st = new ol.style.Style({
+            image: (typeof DEBUG_HIGHLIGHT_MARKERS !== 'undefined' && DEBUG_HIGHLIGHT_MARKERS)
+                ? new ol.style.Circle({
+                    radius: 12,
+                    fill: new ol.style.Fill({ color: 'rgba(220,20,60,0.95)' }),
+                    stroke: new ol.style.Stroke({ color: '#000', width: 2 })
+                })
+                : createFATSymbolImage(FAT_STATUS_SYMBOL_CONFIG[key] || FAT_STATUS_SYMBOL_CONFIG.unknown, 7)
+        });
+        window._customer_style_cache[cacheKey] = st;
+        return st;
+    };
+
+    customerLayer = new ol.layer.Vector({
+
+            source: customerSource,
+
+            // render as image for faster drawing of many points (reduces DOM/Canvas pressure)
+            renderMode: 'image',
+            declutter: true,
+
+            style: customerStyleFunction
+
+        });
+
+        // mark layer with expected properties so other logic and interactions can find it
+        try { customerLayer.set('customerLayer', true); } catch (e) {}
+        try { customerLayer.set('title', 'Customer'); } catch (e) {}
+        try { customerLayer.set('interactive', true); } catch (e) {}
+
+        // Create an expanded-layer used when we need to show individual group members without decluttering
+        try {
+            customerExpandedSource = new ol.source.Vector();
+            customerExpandedLayer = new ol.layer.Vector({
+                source: customerExpandedSource,
+                // do not declutter and render normally so overlapping markers can be spiderfied/offset
+                renderMode: 'vector',
+                declutter: false,
+                style: customerStyleFunction
+            });
+            try { customerExpandedLayer.set('expandedCustomerLayer', true); } catch (e) {}
+            try { customerExpandedLayer.set('title', 'Customer (expanded)'); } catch (e) {}
+            if (typeof map !== 'undefined' && map && typeof map.getLayers === 'function') {
+                // Add expanded layer above base customer layer
+                map.addLayer(customerExpandedLayer);
+                try { if (typeof customerExpandedLayer.setZIndex === 'function') customerExpandedLayer.setZIndex(100000); } catch(e){}
+            }
+        } catch (e) { /* ignore expanded layer creation failures */ }
+    if (typeof map === 'undefined') {
+        console.error('createCustomerLayer: OpenLayers map is undefined.');
+        return;
+    }
+
+    map.addLayer(customerLayer);
+    try {
+        if (typeof customerLayer.setZIndex === 'function') customerLayer.setZIndex(99999);
+    } catch(e){ }
+}
+
+/* =========================================================
+   DRAW MARKERS
+   ========================================================= */
+
+function getCustomersInMapViewport(data) {
+    if (!Array.isArray(data) || typeof map === 'undefined' || !map || !map.getView) return data;
+    const size = map.getSize();
+    if (!size || !size[0] || !size[1]) return data;
+
+    const view = map.getView();
+    const extent = view.calculateExtent(size);
+    const lowerLeft = ol.proj.toLonLat([extent[0], extent[1]]);
+    const upperRight = ol.proj.toLonLat([extent[2], extent[3]]);
+    const marginX = (upperRight[0] - lowerLeft[0]) * 0.2;
+    const marginY = (upperRight[1] - lowerLeft[1]) * 0.2;
+    const minLongitude = lowerLeft[0] - marginX;
+    const maxLongitude = upperRight[0] + marginX;
+    const minLatitude = lowerLeft[1] - marginY;
+    const maxLatitude = upperRight[1] + marginY;
+
+    return data.filter(customer => {
+        const latitude = Number(customer.latitude);
+        const longitude = Number(customer.longitude);
+        return Number.isFinite(latitude) && Number.isFinite(longitude) &&
+            latitude >= minLatitude && latitude <= maxLatitude &&
+            longitude >= minLongitude && longitude <= maxLongitude;
+    });
+}
+
+function focusMapOnCustomers(data) {
+    try {
+        if (typeof map === 'undefined' || !map || !map.getView) return;
+        const view = map.getView();
+        if (!view) return;
+
+        const coords = [];
+        (Array.isArray(data) ? data : []).forEach(customer => {
+            const lat = Number(customer && customer.latitude);
+            const lon = Number(customer && customer.longitude);
+            if (Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) > 1e-6 && Math.abs(lon) > 1e-6) {
+                coords.push(ol.proj.fromLonLat([lon, lat]));
+            }
+        });
+        if (!coords.length) return;
+
+        const size = map.getSize();
+        const hasSize = !!(size && size[0] && size[1]);
+
+        // Satu hasil: langsung animasikan ke marker tersebut.
+        if (coords.length === 1 || !hasSize) {
+            view.animate({ center: coords[0], zoom: Math.max(view.getZoom() || 12, 16), duration: 400 });
+            return;
+        }
+
+        let minX = coords[0][0], minY = coords[0][1], maxX = minX, maxY = minY;
+        coords.forEach(([x, y]) => {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+        });
+
+        // Banyak hasil: fit seluruh marker ke dalam viewport.
+        view.fit([minX, minY, maxX, maxY], {
+            size,
+            padding: [80, 80, 80, 80],
+            maxZoom: 17,
+            duration: 400
+        });
+    } catch (e) {
+        console.warn('focusMapOnCustomers failed', e);
+    }
+}
+
+function focusMapOnCoordinates(latitude, longitude) {
+    const coordinates = ol.proj.fromLonLat([longitude, latitude]);
+    const projectionLatitude = Math.max(-WEB_MERCATOR_MAX_LATITUDE, Math.min(WEB_MERCATOR_MAX_LATITUDE, latitude));
+    const radiusInMapUnits = COORDINATE_SEARCH_RADIUS_METERS / Math.cos(projectionLatitude * Math.PI / 180);
+    if (!coordinateSearchLayer) {
+        coordinateSearchLayer = new ol.layer.Vector({
+            source: new ol.source.Vector(),
+            zIndex: 2147483645,
+            style: feature => feature.get('type') === 'radius'
+                ? new ol.style.Style({
+                    fill: new ol.style.Fill({ color: 'rgba(33,150,243,0.16)' }),
+                    stroke: new ol.style.Stroke({ color: '#2196f3', width: 2 })
+                })
+                : null
+        });
+        map.addLayer(coordinateSearchLayer);
+    }
+
+    coordinateSearchLayer.getSource().clear();
+    coordinateSearchLayer.getSource().addFeature(new ol.Feature({
+        type: 'radius',
+        geometry: new ol.geom.Circle(coordinates, radiusInMapUnits)
+    }));
+    coordinateSearchLayer.getSource().addFeature(new ol.Feature({
+        geometry: new ol.geom.Point(coordinates)
+    }));
+    if (!coordinateSearchOverlay) {
+        coordinateSearchOverlay = createMapEmojiOverlay(
+            '🧍🏿',
+            'user-location-marker',
+            'user-location-marker-anchor',
+            coordinates => {
+                const [longitude, latitude] = ol.proj.toLonLat(coordinates);
+                coordinateSearchCoordinates = [longitude, latitude];
+                const input = document.getElementById('coordinate-search-input');
+                if (input) input.value = `${latitude}, ${longitude}`;
+                const message = document.getElementById('coordinate-search-message');
+                if (message) message.textContent = `Lokasi: ${latitude}, ${longitude} (radius ${COORDINATE_SEARCH_RADIUS_METERS} m)`;
+
+                coordinateSearchLayer.getSource().getFeatures().forEach(feature => {
+                    const geometry = feature.getGeometry();
+                    if (geometry instanceof ol.geom.Circle) geometry.setCenter(coordinates);
+                    else if (geometry instanceof ol.geom.Point) geometry.setCoordinates(coordinates);
+                });
+            }
+        );
+        map.addOverlay(coordinateSearchOverlay);
+    }
+    coordinateSearchOverlay.setPosition(coordinates);
+    map.getView().animate({ center: coordinates, zoom: 16, duration: 500 });
+}
+
+function getGreatCircleDistanceMeters(start, end) {
+    const toRadians = degrees => degrees * Math.PI / 180;
+    const [startLongitude, startLatitude] = start.map(toRadians);
+    const [endLongitude, endLatitude] = end.map(toRadians);
+    const latitudeDelta = endLatitude - startLatitude;
+    const longitudeDelta = endLongitude - startLongitude;
+    const haversine = Math.min(1,
+        Math.sin(latitudeDelta / 2) ** 2 +
+        Math.cos(startLatitude) * Math.cos(endLatitude) * Math.sin(longitudeDelta / 2) ** 2
+    );
+    return 2 * EARTH_MEAN_RADIUS_METERS * Math.atan2(
+        Math.sqrt(haversine),
+        Math.sqrt(Math.max(0, 1 - haversine))
+    );
+}
+
+function createCoordinateRulerLayer() {
+    if (coordinateRulerLayer) return;
+    coordinateRulerLayer = new ol.layer.Vector({
+        source: new ol.source.Vector(),
+        zIndex: 2147483647,
+        style: feature => {
+            if (feature.get('type') === 'label') {
+                return new ol.style.Style({
+                    text: new ol.style.Text({
+                        text: feature.get('label'),
+                        font: 'bold 14px sans-serif',
+                        offsetY: -16,
+                        fill: new ol.style.Fill({ color: '#111827' }),
+                        stroke: new ol.style.Stroke({ color: '#ffffff', width: 4 })
+                    })
+                });
+            }
+            if (feature.get('type') === 'vertex') {
+                return new ol.style.Style({
+                    image: new ol.style.Circle({
+                        radius: 5,
+                        fill: new ol.style.Fill({ color: '#f97316' }),
+                        stroke: new ol.style.Stroke({ color: '#ffffff', width: 2 })
+                    })
+                });
+            }
+            return new ol.style.Style({
+                stroke: new ol.style.Stroke({ color: '#f97316', width: 3 })
+            });
+        }
+    });
+    map.addLayer(coordinateRulerLayer);
+}
+
+function formatCoordinateRulerDistance(distanceMeters) {
+    return distanceMeters >= 1000
+        ? `${(distanceMeters / 1000).toFixed(2)} km`
+        : `${Math.round(distanceMeters)} m`;
+}
+
+function updateCoordinateRulerDisplay(previewCoordinate) {
+    if (!coordinateRulerPoints.length) return;
+
+    const lineCoordinates = coordinateRulerPoints.map(coordinate => coordinate.slice());
+    let distanceMeters = coordinateRulerDistanceMeters;
+    if (previewCoordinate) {
+        const lastPoint = lineCoordinates[lineCoordinates.length - 1];
+        if (previewCoordinate[0] !== lastPoint[0] || previewCoordinate[1] !== lastPoint[1]) {
+            distanceMeters += getGreatCircleDistanceMeters(
+                ol.proj.toLonLat(lastPoint),
+                ol.proj.toLonLat(previewCoordinate)
+            );
+            lineCoordinates.push(previewCoordinate.slice());
+        }
+    }
+
+    if (lineCoordinates.length < 2) return;
+    createCoordinateRulerLayer();
+    const endCoordinate = lineCoordinates[lineCoordinates.length - 1];
+    if (!coordinateRulerLineFeature) {
+        coordinateRulerLineFeature = new ol.Feature({
+            type: 'line',
+            geometry: new ol.geom.LineString(lineCoordinates)
+        });
+        coordinateRulerLabelFeature = new ol.Feature({
+            type: 'label',
+            label: '',
+            geometry: new ol.geom.Point(endCoordinate)
+        });
+        coordinateRulerLayer.getSource().addFeatures([
+            coordinateRulerLineFeature,
+            coordinateRulerLabelFeature
+        ]);
+    } else {
+        coordinateRulerLineFeature.getGeometry().setCoordinates(lineCoordinates);
+        coordinateRulerLabelFeature.getGeometry().setCoordinates(endCoordinate);
+    }
+
+    coordinateRulerLabelFeature.set('label', formatCoordinateRulerDistance(distanceMeters));
+}
+
+function scheduleViewportCustomerRender() {
+    if (!activeMapCustomers.length || mapViewportRenderTimer !== null) return;
+    mapViewportRenderTimer = setTimeout(() => {
+        mapViewportRenderTimer = null;
+        drawCustomers(activeMapCustomers, activeMapDrawOptions);
+    }, 120);
+}
+
+function drawCustomers(data, options){
+
+    customerDrawVersion++;
+
+    console.log('drawCustomers: incoming data length=', Array.isArray(data)?data.length:0, 'drawVersion=', customerDrawVersion);
+
+    if(!customerSource) {
+        console.error('drawCustomers: customerSource is not initialized');
+        return;
+    }
+
+    activeMapCustomers = Array.isArray(data) ? data : [];
+    activeMapDrawOptions = options || {};
+    const totalDataCount = activeMapCustomers.length;
+    data = (activeMapDrawOptions && activeMapDrawOptions.ignoreViewport)
+        ? activeMapCustomers
+        : getCustomersInMapViewport(activeMapCustomers);
+    console.log('[DRAW] viewport rows=', data.length, 'of', totalDataCount);
+
+    if (customerDrawTimeout) {
+        try { clearTimeout(customerDrawTimeout); } catch (e) { }
+        customerDrawTimeout = null;
+    }
+
+    try { if (customerSource && typeof customerSource.clear === 'function') customerSource.clear(); } catch (e) {}
+    try { if (customerLayer && customerLayer.getSource && customerLayer.getSource() && typeof customerLayer.getSource().clear === 'function') customerLayer.getSource().clear(); } catch (e) {}
+    try { if (customerExpandedSource && typeof customerExpandedSource.clear === 'function') customerExpandedSource.clear(); } catch (e) {}
+    try { if (customerExpandedLayer && customerExpandedLayer.getSource && customerExpandedLayer.getSource() && typeof customerExpandedLayer.getSource().clear === 'function') customerExpandedLayer.getSource().clear(); } catch (e) {}
+
+    const originalFeatures = [];
+    const adjustedFeatures = [];
+    const skippedSamples = [];
+
+    // Allow option to expand group members into individual markers when requested
+    // If options.expandGroups is true, render one marker per input row instead of aggregating by ID.
+    const opts = activeMapDrawOptions;
+    const expandGroups = !!opts.expandGroups;
+
+    const makeFeature = (customer, sourceCustomer = customer) => {
+        const feat = new ol.Feature({
+            geometry: new ol.geom.Point(
+                ol.proj.fromLonLat([
+                    Number(customer.longitude),
+                    Number(customer.latitude)
+                ])
+            ),
+            customer,
+            sourceCustomer
+        });
+        try{ feat.set('drawVersion', customerDrawVersion); }catch(e){}
+        try{ if (customer && typeof customer === 'object') customer.__drawVersion = customerDrawVersion; }catch(e){}
+        return feat;
+    };
+
+    let individualCount = 0;
+
+    let idMap = new Map();
+
+    if (expandGroups) {
+        // Build groupMembers index: group all rows by id_customer so popup can show duplicates
+        const groupIdMap = new Map();
+        data.forEach(customer => {
+            const cid = String(customer.id || '').trim();
+            if (!cid) return;
+            const key = `${customer.dataType || 'FAT'}::${cid}`;
+            if (!groupIdMap.has(key)) groupIdMap.set(key, []);
+            groupIdMap.get(key).push(customer);
+        });
+
+        // Render a feature for every input row (useful when filtering by ward/district to show all group members)
+        // Place each marker at a random point within its ward polygon to avoid overlap and keep them within boundaries.
+        let randPtCount = 0, fallbackCount = 0, origCoordsCount = 0, wardNotFound = new Set();
+        
+        // Helper: generate a small random scatter offset (~30m) for fallback when no polygon is found
+        const smallRandomOffset = (baseLat, baseLon, idx, total) => {
+            const metersToDeg = m => m / 111320.0;
+            const lonScale = Math.cos(baseLat * Math.PI / 180) || 1;
+            // Random angle and radius up to ~50 meters, with slight spiral to separate overlapping markers
+            const angle = (2 * Math.PI * idx / Math.max(total, 1)) + (Math.random() * 0.5);
+            const radius = metersToDeg(20 + Math.random() * 280); // 20-300m random spread
+            return {
+                latitude: baseLat + radius * Math.sin(angle),
+                longitude: baseLon + (radius * Math.cos(angle)) / lonScale
+            };
+        };
+
+        data.forEach((customer, idx) => {
+            const hasOriginalPoint = hasValidCustomerCoordinates(customer);
+
+            // Try random polygon point only when original coordinates are missing or invalid.
+            let randPt = hasOriginalPoint ? null : getRandomPointInWard(customer.city, customer.district, customer.ward);
+
+            // Fallback: direct lookup in wardPolygonIndex with multiple key variants
+            if (!randPt && !hasOriginalPoint && wardPolygonIndex.size > 0) {
+                const nc = normalize(customer.city || '');
+                const nd = normalize(customer.district || '');
+                const nw = normalize(customer.ward || '');
+                const strippedNd = normalize(stripAdminPrefixes(customer.district || ''));
+                const nwShort = normalize(shortWardName(customer.ward || ''));
+                const nwNoSpace = normalize((customer.ward || '').replace(/\s+/g, ''));
+                const wardKeys = [nw, nwShort, normalize(stripAdminPrefixes(customer.ward || '')), nwNoSpace].filter(Boolean);
+                const districtKeys = [nd, strippedNd].filter(Boolean);
+                const cityKeys = [nc, normalize(stripAdminPrefixes(customer.city || ''))].filter(Boolean);
+                for (const ck of cityKeys) {
+                    for (const dk of districtKeys) {
+                        for (const wk of wardKeys) {
+                            const key = normalizeLocationKey(ck, dk, wk);
+                            if (wardPolygonIndex.has(key)) {
+                                randPt = getRandomPointInPolygonRings(wardPolygonIndex.get(key));
+                                if (randPt) break;
+                            }
+                        }
+                        if (randPt) break;
+                    }
+                    if (randPt) break;
+                }
+                // Fuzzy: match by partial ward name within same district
+                if (!randPt) {
+                    const targetWard = normalizeKey(nw);
+                    const targetDistrict = normalizeKey(nd);
+                    for (const [key, rings] of wardPolygonIndex.entries()) {
+                        try {
+                            const parts = key.split('||').map(p => normalizeKey(p || ''));
+                            const kDistrict = parts[1] || '';
+                            const kWard = parts[2] || '';
+                            const wardMatch = targetWard && kWard && (kWard.includes(targetWard) || targetWard.includes(kWard));
+                            const districtMatch = !targetDistrict || (kDistrict && (kDistrict.includes(targetDistrict) || targetDistrict.includes(kDistrict)));
+                            if (wardMatch && districtMatch) {
+                                randPt = getRandomPointInPolygonRings(rings);
+                                if (randPt) break;
+                            }
+                        } catch(e) {}
+                    }
+                }
+                // Final fallback: pick any random polygon from the same district
+                if (!randPt && nd) {
+                    const targetDistrict = normalizeKey(nd);
+                    const sameDistrict = [];
+                    for (const [key, rings] of wardPolygonIndex.entries()) {
+                        try {
+                            const parts = key.split('||').map(p => normalizeKey(p || ''));
+                            const kDistrict = parts[1] || '';
+                            if (kDistrict && (kDistrict.includes(targetDistrict) || targetDistrict.includes(kDistrict))) {
+                                sameDistrict.push(rings);
+                            }
+                        } catch(e) {}
+                    }
+                    if (sameDistrict.length > 0) {
+                        const pick = sameDistrict[Math.floor(Math.random() * sameDistrict.length)];
+                        randPt = getRandomPointInPolygonRings(pick);
+                    }
+                }
+            }
+
+            let c;
+            if (hasOriginalPoint) {
+                c = Object.assign({}, customer);
+                c.__useRandomPosition = false;
+                origCoordsCount++;
+            } else if (randPt) {
+                // Polygon found: use random point only when there is no valid coordinate to preserve site accuracy.
+                randPtCount++;
+                c = Object.assign({}, customer);
+                c.latitude = randPt.latitude;
+                c.longitude = randPt.longitude;
+                c.__useRandomPosition = true;
+                c.resolvedBy = (customer.resolvedBy || 'original') + '|randomInPolygon';
+            } else {
+                // No polygon found: if customer already has valid coordinates, keep them as-is.
+                const origLat = Number(customer.latitude) || 0;
+                const origLon = Number(customer.longitude) || 0;
+                const hasDecimals = (String(origLat).split('.')[1] || '').length >= 2 && (String(origLon).split('.')[1] || '').length >= 2;
+                const hasValidCoords = Number.isFinite(origLat) && Number.isFinite(origLon) && Math.abs(origLat) > 0.1 && Math.abs(origLon) > 100 && origLat >= -9.5 && origLat <= -6.0 && origLon >= 111.0 && origLon <= 116.5 && hasDecimals;
+                if (hasValidCoords) {
+                    c = Object.assign({}, customer);
+                    c.__useRandomPosition = false;
+                    origCoordsCount++;
+                } else {
+                    // No valid coords: fall back to snapCustomerToWard (centroid) without random scatter.
+                    fallbackCount++;
+                    wardNotFound.add(customer.ward + '|' + customer.district);
+                    c = snapCustomerToWard(customer);
+                    const baseLat = Number(c.latitude) || 0;
+                    const baseLon = Number(c.longitude) || 0;
+                    if (!Number.isFinite(baseLat) || !Number.isFinite(baseLon) || Math.abs(baseLat) <= 1e-6 || Math.abs(baseLon) <= 1e-6) {
+                        if (skippedSamples.length < 20) skippedSamples.push({id: c.id, lat: c.latitude, lon: c.longitude});
+                        return;
+                    }
+                    c.__useRandomPosition = false;
+                }
+            }
+            const lat = Number(c.latitude);
+            const lon = Number(c.longitude);
+            if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) <= 1e-6 || Math.abs(lon) <= 1e-6) {
+                if (skippedSamples.length < 20) skippedSamples.push({id: c.id, lat: c.latitude, lon: c.longitude});
+                return;
+            }
+            if (idx < 20) console.log('[DRAW] ward=' + customer.ward + ' district=' + customer.district + ' randPt=' + (randPt ? 'YES' : 'NO') + ' lat=' + (randPt ? randPt.latitude : c.latitude) + ' lon=' + (randPt ? randPt.longitude : c.longitude) + ' resolvedBy=' + (c.resolvedBy || 'original'));
+            // Attach groupMembers from id_customer duplicates
+            const cid = String(c.id || '').trim();
+            const members = cid ? groupIdMap.get(`${c.dataType || 'FAT'}::${cid}`) : null;
+            if (members && members.length > 1) {
+                c.groupMembers = members;
+                c.groupCount = members.length;
+            }
+            const feature = makeFeature(c, customer);
+            if (c.resolvedBy && c.resolvedBy !== 'original') adjustedFeatures.push(feature); else originalFeatures.push(feature);
+            individualCount++;
+        })
+        console.log('[DRAW] SUMMARY: total=' + data.length + ' randPt=' + randPtCount + ' origCoords=' + origCoordsCount + ' fallback(centroid)=' + fallbackCount + ' wardsNoPolygon=' + Array.from(wardNotFound).join('; '));
+
+    } else {
+        // Group customers by ID. Same customer ID with multiple records → single marker with group members.
+        idMap = new Map();
+
+        data.forEach((customer, idx) => {
+            if (idx < 10) {
+                try { console.log(`drawCustomers: sample[${idx}] id=${customer.id} lat=${customer.latitude} lon=${customer.longitude} resolvedBy=${customer.resolvedBy || 'original'}`); } catch(e) {}
+            }
+            const custId = String(customer.id || '').trim();
+            const key = custId ? `id::${customer.dataType || 'FAT'}::${custId}` : `unknown::${idx}`;
+            if (!idMap.has(key)) idMap.set(key, []);
+            idMap.get(key).push(customer);
+        });
+
+        const chooseRepresentative = items => items.find(m => {
+            const la = Number(m.latitude);
+            const lo = Number(m.longitude);
+            return Number.isFinite(la) && Number.isFinite(lo) && Math.abs(la) > 1e-6 && Math.abs(lo) > 1e-6;
+        }) || items[0];
+
+        for (const [groupKey, members] of idMap.entries()) {
+            if (!members || members.length === 0) continue;
+
+            if (members.length === 1) {
+                let customer = members[0];
+                // ensure marker follows ward/district polygon if available
+                customer = snapCustomerToWard(customer);
+                const lat = Number(customer.latitude);
+                const lon = Number(customer.longitude);
+                if (Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) > 1e-6 && Math.abs(lon) > 1e-6) {
+                    const feature = makeFeature(customer);
+                    if (customer.resolvedBy && customer.resolvedBy !== 'original') adjustedFeatures.push(feature); else originalFeatures.push(feature);
+                    individualCount++;
+                } else {
+                    if (skippedSamples.length < 20) skippedSamples.push({id: customer.id, lat: customer.latitude, lon: customer.longitude});
+                }
+                continue;
+            }
+
+            // Multiple records for same customer ID: prefer the original site coordinates when valid.
+            const rep = chooseRepresentative(members);
+            const city = rep.city || members[0].city || '';
+            const district = rep.district || members[0].district || '';
+            const ward = rep.ward || members[0].ward || '';
+
+            let coord = null;
+            if (hasValidCustomerCoordinates(rep)) {
+                coord = { latitude: Number(rep.latitude), longitude: Number(rep.longitude) };
+            } else {
+                coord = getCoordinateFromCsvWard(city, district, ward) || getCoordinateFromWard(city, district, ward) || getRandomPointInWard(city, district, ward);
+            }
+
+            if (!coord) {
+                if (skippedSamples.length < 20) skippedSamples.push({id: groupKey, count: members.length, city, district, ward});
+                continue;
+            }
+
+            let sampleCustomer = {
+                id: rep.id || groupKey,
+                username: rep.username || '',
+                city: city,
+                district: district,
+                ward: ward,
+                site: rep.site || '',
+                team: rep.team || '',
+                vendor: rep.vendor || '',
+                status: rep.status || '',
+                dataType: rep.dataType || 'FAT',
+                visitDate: rep.visitDate || '',
+                latitude: coord.latitude,
+                longitude: coord.longitude,
+                groupCount: members.length,
+                groupMembers: members,
+                dataFatFull: rep.dataFatFull || {},
+                resolvedBy: (rep.resolvedBy || 'original') + '|idGroup'
+            };
+
+            // ensure group representative marker follows ward/district polygon if available (idempotent)
+            sampleCustomer = snapCustomerToWard(sampleCustomer);
+            const feature = makeFeature(sampleCustomer);
+            if (sampleCustomer.resolvedBy && sampleCustomer.resolvedBy !== 'original') adjustedFeatures.push(feature); else originalFeatures.push(feature);
+        }
+    }
+
+    const totalFeatures = originalFeatures.length + adjustedFeatures.length;
+    console.log('drawCustomers: immediateFeatures=', originalFeatures.length, 'adjustedFeatures=', adjustedFeatures.length, 'skippedSamples=', skippedSamples.length, 'individualCount=', individualCount, 'idGroups=', idMap.size, 'totalFeatures=', totalFeatures);
+
+    try {
+        if (typeof map !== 'undefined' && map && map.getView && typeof map.getView === 'function') {
+            const center = ol.proj.toLonLat(map.getView().getCenter());
+            console.log('drawCustomers: map center (lon,lat)=', center, 'zoom=', map.getView().getZoom());
+        }
+    } catch (e) {}
+
+    const addFeaturesInBatches = (features, chunkSize = 5000, targetSource = customerSource) => {
+        const drawVersion = customerDrawVersion;
+        let added = 0;
+        const addBatch = () => {
+            if (drawVersion !== customerDrawVersion) return;
+            const chunk = features.slice(added, added + chunkSize);
+            if (chunk.length === 0) return;
+            try {
+                targetSource.addFeatures(chunk);
+                added += chunk.length;
+                if (typeof map !== 'undefined' && map && typeof map.render === 'function') {
+                    try { map.render(); } catch (e) {}
+                }
+                // remove any leftover features from previous draws whose drawVersion doesn't match
+                try{
+                    const all = targetSource.getFeatures();
+                    for (let i = all.length - 1; i >= 0; i--) {
+                        const f = all[i];
+                        const dv = f.get && f.get('drawVersion');
+                        if (dv !== drawVersion) {
+                            targetSource.removeFeature(f);
+                        }
+                    }
+                }catch(e){}
+            } catch (e) {
+                console.error('drawCustomers: error adding feature chunk', e);
+            }
+            if (added < features.length && drawVersion === customerDrawVersion) {
+                customerDrawTimeout = setTimeout(addBatch, 0);
+            }
+        };
+        addBatch();
+    };
+
+    const targetSourceForOriginal = expandGroups && customerExpandedSource ? customerExpandedSource : customerSource;
+    const targetSourceForAdjusted = expandGroups && customerExpandedSource ? customerExpandedSource : customerSource;
+
+    if (originalFeatures.length > 0) {
+        if (originalFeatures.length <= 5000) {
+            try { targetSourceForOriginal.addFeatures(originalFeatures); } catch (e) { addFeaturesInBatches(originalFeatures, 5000, targetSourceForOriginal); }
+        } else {
+            addFeaturesInBatches(originalFeatures, 5000, targetSourceForOriginal);
+        }
+    }
+
+    if (adjustedFeatures.length > 0) {
+        customerDrawTimeout = setTimeout(() => {
+            const active = (drawVersion => {
+                if (drawVersion !== customerDrawVersion) return false;
+                addFeaturesInBatches(adjustedFeatures, 3000, targetSourceForAdjusted);
+                return true;
+            })(customerDrawVersion);
+            if (!active) customerDrawTimeout = null;
+        }, 0);
+    }
+
+    if (originalFeatures.length === 0 && adjustedFeatures.length === 0) {
+        console.warn('drawCustomers: no features added after grouping');
+    }
+
+    try {
+        if (typeof map !== 'undefined' && map && typeof map.getLayers === 'function') {
+            if (customerLayer && typeof customerLayer.setZIndex === 'function') customerLayer.setZIndex(99999);
+        }
+    } catch (e) {}
+}
+
+
+/* =========================================================
+   POPUP
+   ========================================================= */
+
+// ==========================
+// MARKER EDITING
+// ==========================
+let markerDragInteraction = null;
+let markerDragState = null;
+let markerDraggingStyles = [];
+let markerDragAnimationFrame = null;
+
+function setupMarkerTranslation() {
+    try {
+        if (markerDragInteraction || !map) return;
+
+        if (typeof customerLayer === 'undefined' || !customerLayer) {
+            console.warn('setupMarkerTranslation: customerLayer not available');
+            return;
+        }
+
+        const isCustomerMarkerLayer = layer => layer === customerLayer || layer === customerExpandedLayer;
+        const getCustomerMarkerAtPixel = pixel => map.forEachFeatureAtPixel(
+            pixel,
+            feature => feature.get('customer') ? feature : undefined,
+            { layerFilter: isCustomerMarkerLayer, hitTolerance: 8 }
+        );
+        const isDraggableCustomerMarker = feature => {
+            const customer = feature && feature.get('customer');
+            const dataType = String(customer && customer.dataType || 'FAT').trim().toUpperCase();
+            return dataType !== 'FAT' && dataType !== 'FDT';
+        };
+        const mapElement = map.getTargetElement && map.getTargetElement();
+
+        markerDragInteraction = new ol.interaction.Pointer({
+            handleDownEvent: event => {
+                if (coordinateRulerActive) return false;
+                const originalEvent = event.originalEvent;
+                if (originalEvent && originalEvent.button !== undefined && originalEvent.button !== 0) return false;
+
+                const feature = getCustomerMarkerAtPixel(event.pixel);
+                if (!isDraggableCustomerMarker(feature)) return false;
+
+                markerDragState = {
+                    feature,
+                    lastCoordinate: event.coordinate.slice(),
+                    moved: false
+                };
+                if (mapElement) mapElement.style.cursor = 'grabbing';
+                return true;
+            },
+            handleDragEvent: event => {
+                const state = markerDragState;
+                if (!state) return;
+                const geometry = state.feature.getGeometry();
+                if (!geometry || typeof geometry.translate !== 'function') return;
+
+                const deltaX = event.coordinate[0] - state.lastCoordinate[0];
+                const deltaY = event.coordinate[1] - state.lastCoordinate[1];
+                if (deltaX === 0 && deltaY === 0) return;
+
+                geometry.translate(deltaX, deltaY);
+                state.lastCoordinate = event.coordinate.slice();
+                state.moved = true;
+                animateMarkerWhileDragging(state.feature);
+            },
+            handleMoveEvent: event => {
+                if (markerDragState) return;
+                if (mapElement) {
+                    const feature = getCustomerMarkerAtPixel(event.pixel);
+                    mapElement.style.cursor = isDraggableCustomerMarker(feature) ? 'grab' : '';
+                }
+            },
+            handleUpEvent: () => {
+                const state = markerDragState;
+                if (!state) return false;
+
+                markerDragState = null;
+                stopMarkerDragAnimation();
+                if (mapElement) mapElement.style.cursor = '';
+
+                const customer = state.feature.get('customer');
+                if (!state.moved) {
+                    if (customer) showCustomerPopup(customer, state.feature);
+                    return false;
+                }
+
+                const coordinates = state.feature.getGeometry().getCoordinates();
+                const [longitude, latitude] = ol.proj.toLonLat(coordinates);
+                if (customer && typeof customer === 'object') {
+                    customer.latitude = latitude;
+                    customer.longitude = longitude;
+                    customer.__edited = true;
+                }
+                const sourceCustomer = state.feature.get('sourceCustomer');
+                if (sourceCustomer && typeof sourceCustomer === 'object') {
+                    sourceCustomer.latitude = latitude;
+                    sourceCustomer.longitude = longitude;
+                    sourceCustomer.__edited = true;
+                }
+                state.feature.changed();
+
+                const popup = document.getElementById('popup-content');
+                if (popup) {
+                    popup.innerHTML = '<div class="customer-popup"><p>Marker posisi diperbarui. Jangan lupa menyimpan perubahan.</p></div>';
+                    if (typeof container !== 'undefined') container.style.display = 'block';
+                    if (typeof overlayPopup !== 'undefined') overlayPopup.setPosition(coordinates);
+                }
+                return false;
+            }
+        });
+
+        map.addInteraction(markerDragInteraction);
+
+    } catch (e) {
+        markerDragInteraction = null;
+        console.warn('setupMarkerTranslation failed', e);
+    }
+}
+
+function animateMarkerWhileDragging(feature) {
+    if (!markerDraggingStyles.length && feature && typeof feature.setStyle === 'function') {
+        const styleFunction = customerLayer && customerLayer.getStyle && customerLayer.getStyle();
+        const baseStyle = typeof styleFunction === 'function' ? styleFunction(feature) : null;
+        const ringImage = new ol.style.Circle({
+            radius: 10,
+            fill: new ol.style.Fill({ color: 'rgba(59, 130, 246, 0.18)' }),
+            stroke: new ol.style.Stroke({ color: 'rgba(37, 99, 235, 0.9)', width: 2 })
+        });
+        const ringStyle = new ol.style.Style({ image: ringImage });
+        feature.setStyle(baseStyle ? [ringStyle, ...(Array.isArray(baseStyle) ? baseStyle : [baseStyle])] : ringStyle);
+        markerDraggingStyles.push({ feature, ringImage });
+
+        const animate = timestamp => {
+            if (!markerDraggingStyles.length) return;
+            ringImage.setRadius(10 + (1 + Math.sin(timestamp / 140)) * 2.5);
+            if (map && typeof map.render === 'function') map.render();
+            markerDragAnimationFrame = requestAnimationFrame(animate);
+        };
+        markerDragAnimationFrame = requestAnimationFrame(animate);
+    }
+}
+
+function stopMarkerDragAnimation() {
+    if (markerDragAnimationFrame !== null) {
+        cancelAnimationFrame(markerDragAnimationFrame);
+        markerDragAnimationFrame = null;
+    }
+    markerDraggingStyles.forEach(({ feature }) => {
+        if (feature && typeof feature.setStyle === 'function') feature.setStyle(null);
+    });
+    markerDraggingStyles = [];
+}
+
+function getProjectUrl(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return '';
+
+    try {
+        const url = new URL(text);
+        return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+    } catch (error) {
+        return '';
+    }
+}
+
+function projectLinkButton(value, label) {
+    const url = getProjectUrl(value);
+    if (!url) return '';
+    return `<a class="project-link-button" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
+}
+
+function groupProjectsByName(projects) {
+    const groups = new Map();
+    projects.forEach(project => {
+        const locationKey = Number.isFinite(project.latitude) && Number.isFinite(project.longitude)
+            ? `${project.latitude.toFixed(6)},${project.longitude.toFixed(6)}`
+            : String(project.location || '').trim();
+        const key = `${locationKey}|${project.name || ''}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(project);
+    });
+    return [...groups.values()];
+}
+
+function sortProjectMilestones(projects) {
+    return projects.slice().sort((first, second) => {
+        const firstIsStart = String(first.workStatus || '').trim().toLowerCase() === 'start instalasi';
+        const secondIsStart = String(second.workStatus || '').trim().toLowerCase() === 'start instalasi';
+        if (firstIsStart !== secondIsStart) return firstIsStart ? -1 : 1;
+        const firstDate = getProjectDateTimestamp(first.implementationDate) ?? Infinity;
+        const secondDate = getProjectDateTimestamp(second.implementationDate) ?? Infinity;
+        return firstDate === secondDate ? 0 : firstDate - secondDate;
+    });
+}
+
+function renderProjectDataTable() {
+    const tbody = document.getElementById('project-data-tbody');
+    const count = document.getElementById('project-data-count');
+    if (!tbody) return;
+
+    const projectGroups = groupProjectsByName(filteredProjectRecords);
+    const totalProjectCount = groupProjectsByName(projectRecords).length;
+    tbody.innerHTML = projectGroups.map(projectGroup => {
+        const project = projectGroup[0];
+        const milestones = sortProjectMilestones(projectGroup);
+        return `
+        <tr>
+            <td>${escapeHtml(project.city || '-')}</td>
+            <td>${escapeHtml(project.name || '-')}</td>
+            <td>${escapeHtml(project.pic || '-')}</td>
+            <td>${escapeHtml(project.location || '-')}</td>
+            <td>${milestones.map(milestone => `<div>${escapeHtml(milestone.implementationDate || '-')}</div>`).join('')}</td>
+            <td>${milestones.map(milestone => `<div>${escapeHtml(milestone.workStatus || '-')}</div>`).join('')}</td>
+            <td>${projectLinkButton(project.rackUrl, 'Buka Data rack') || '-'}</td>
+            <td>${projectLinkButton(project.documentationUrl, 'Buka Dokumentasi') || '-'}</td>
+        </tr>
+    `;
+    }).join('');
+
+    if (count) count.textContent = `${projectGroups.length} dari ${totalProjectCount} project`;
+}
+
+function openProjectDataView() {
+    const overlay = document.getElementById('project-data-overlay');
+    if (!overlay) return;
+    renderProjectDataTable();
+    overlay.hidden = false;
+}
+
+function setupProjectDataView() {
+    const overlay = document.getElementById('project-data-overlay');
+    const openButton = document.getElementById('view-project-data-button');
+    const closeButton = document.getElementById('project-data-close');
+    const popup = document.getElementById('popup-content');
+
+    if (openButton && !openButton.dataset.projectViewBound) {
+        openButton.dataset.projectViewBound = 'true';
+        openButton.addEventListener('click', openProjectDataView);
+    }
+    if (closeButton && !closeButton.dataset.projectViewBound) {
+        closeButton.dataset.projectViewBound = 'true';
+        closeButton.addEventListener('click', () => {
+            if (overlay) overlay.hidden = true;
+        });
+    }
+    if (popup && !popup.dataset.projectViewBound) {
+        popup.dataset.projectViewBound = 'true';
+        popup.addEventListener('click', event => {
+            if (event.target.closest('.project-popup-data-button')) openProjectDataView();
+        });
+    }
+}
+
+function getProjectDateTimestamp(value) {
+    const text = String(value ?? '').trim();
+    const match = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (match) {
+        const [, day, month, year] = match;
+        const timestamp = Date.UTC(Number(year), Number(month) - 1, Number(day));
+        const date = new Date(timestamp);
+        if (
+            date.getUTCFullYear() === Number(year) &&
+            date.getUTCMonth() === Number(month) - 1 &&
+            date.getUTCDate() === Number(day)
+        ) return timestamp;
+        return null;
+    }
+
+    const timestamp = Date.parse(text);
+    return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function getProjectLocationEmojis(value) {
+    return [...new Set(String(value ?? '').match(/\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?/gu) || [])];
+}
+
+function getProjectLocationLabel(value) {
+    return String(value ?? '')
+        .replace(/\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?/gu, '')
+        .trim();
+}
+
+function createProjectFeatures(records) {
+    const projectsByLocation = new Map();
+    records.forEach(project => {
+        const key = `${project.latitude.toFixed(6)},${project.longitude.toFixed(6)}`;
+        if (!projectsByLocation.has(key)) projectsByLocation.set(key, []);
+        projectsByLocation.get(key).push(project);
+    });
+
+    return [...projectsByLocation.values()].map(projects => {
+        const first = projects[0];
+        return new ol.Feature({
+            geometry: new ol.geom.Point(ol.proj.fromLonLat([first.longitude, first.latitude])),
+            projects
+        });
+    });
+}
+
+function updateProjectFilterOptions() {
+    const setOptions = (id, values, placeholder) => {
+        const select = document.getElementById(id);
+        if (!select) return;
+        const selected = select.value;
+        select.replaceChildren(new Option(placeholder, ''));
+        values.forEach(value => select.add(new Option(value, value)));
+        select.value = values.includes(selected) ? selected : '';
+    };
+    const uniqueValues = field => [...new Set(projectRecords.map(project => project[field]).filter(Boolean))];
+    const implementationDates = uniqueValues('implementationDate').sort((first, second) =>
+        (getProjectDateTimestamp(second) ?? -Infinity) - (getProjectDateTimestamp(first) ?? -Infinity)
+    );
+
+    setOptions('project-filter-city', uniqueValues('city').sort((a, b) => a.localeCompare(b)), 'Semua City');
+    setOptions('project-filter-location', uniqueValues('location').sort((a, b) => a.localeCompare(b)), 'Semua Lokasi Project');
+    setOptions('project-filter-implementation-date', implementationDates, 'Semua Tanggal implementasi');
+}
+
+function applyProjectFilters() {
+    const keyword = normalize(document.getElementById('project-filter-name')?.value || '').toLowerCase();
+    const city = document.getElementById('project-filter-city')?.value || '';
+    const location = document.getElementById('project-filter-location')?.value || '';
+    const implementationDate = document.getElementById('project-filter-implementation-date')?.value || '';
+
+    filteredProjectRecords = projectRecords.filter(project =>
+        (!keyword || normalize(project.name).toLowerCase().includes(keyword)) &&
+        (!city || project.city === city) &&
+        (!location || project.location === location) &&
+        (!implementationDate || project.implementationDate === implementationDate)
+    );
+
+    if (projectLayer) {
+        const source = projectLayer.getSource();
+        source.clear(true);
+        source.addFeatures(createProjectFeatures(filteredProjectRecords));
+    }
+
+    updateProjectSummary(filteredProjectRecords);
+    updateProjectCharts(filteredProjectRecords);
+    if (document.getElementById('project-data-overlay')?.hidden === false) {
+        renderProjectDataTable();
+    }
+}
+
+function updateProjectSummary(records) {
+    const total = document.getElementById('total-customer');
+    const cities = document.getElementById('total-ward');
+    if (total) {
+        total.textContent = String(new Set(
+            records.map(project => String(project.name ?? '').trim()).filter(Boolean)
+        ).size);
+    }
+    if (cities) cities.textContent = String(new Set(records.map(project => project.city).filter(Boolean)).size);
+}
+
+function updateProjectCharts(records) {
+    const projectsByLocation = new Map();
+    const projectsByImplementationDate = new Map();
+    records.forEach(project => {
+        const location = project.location || 'Lokasi tidak diketahui';
+        const implementationDate = project.implementationDate || 'Tanggal implementasi tidak tersedia';
+        const projectName = String(project.name || '').trim();
+        if (!projectsByLocation.has(location)) projectsByLocation.set(location, new Set());
+        if (!projectsByImplementationDate.has(implementationDate)) {
+            projectsByImplementationDate.set(implementationDate, new Set());
+        }
+        projectsByLocation.get(location).add(projectName);
+        projectsByImplementationDate.get(implementationDate).add(projectName);
+    });
+    const locationCounts = new Map([...projectsByLocation].map(([location, names]) => [location, names.size]));
+    const implementationDateCounts = new Map(
+        [...projectsByImplementationDate].map(([date, names]) => [date, names.size])
+    );
+
+    const locations = [...locationCounts.keys()].sort((first, second) => first.localeCompare(second));
+    const implementationDates = [...implementationDateCounts.keys()].sort((first, second) =>
+        (getProjectDateTimestamp(first) ?? Infinity) - (getProjectDateTimestamp(second) ?? Infinity)
+    );
+    const colors = ['#2563eb', '#16a34a', '#f59e0b', '#8b5cf6', '#ef4444', '#0891b2'];
+    const locationColors = locations.map((_, index) => colors[index % colors.length]);
+    const locationCanvas = document.getElementById('ward-chart');
+    const atpCanvas = document.getElementById('odc-chart');
+    const locationLegend = document.getElementById('legend');
+
+    if (locationLegend) {
+        locationLegend.innerHTML = locations.map((location, index) => `
+            <div class="legend-item">
+                <span class="legend-color" style="background:${locationColors[index]}"></span>
+                <span>${escapeHtml(location)}: ${locationCounts.get(location)}</span>
+            </div>
+        `).join('');
+    }
+
+    if (typeof Chart !== 'function') return;
+
+    if (wardChart) wardChart.destroy();
+    if (odcChart) odcChart.destroy();
+
+    if (locationCanvas) {
+        wardChart = new Chart(locationCanvas, {
+            type: 'doughnut',
+            data: {
+                labels: locations,
+                datasets: [{
+                    label: 'Jumlah Pekerjaan',
+                    data: locations.map(location => locationCounts.get(location)),
+                    backgroundColor: locationColors,
+                    borderColor: '#ffffff',
+                    borderWidth: 2
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                }
+            }
+        });
+    }
+
+    if (atpCanvas) {
+        odcChart = new Chart(atpCanvas, {
+            type: 'bar',
+            data: {
+                labels: implementationDates,
+                datasets: [{
+                    label: 'Jumlah Pekerjaan',
+                    data: implementationDates.map(date => implementationDateCounts.get(date)),
+                    backgroundColor: '#1769aa',
+                    borderRadius: 5
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: { precision: 0 }
+                    }
+                }
+            }
+        });
+    }
+}
+
+function setupProjectFilters() {
+    const nameSearch = document.getElementById('project-filter-name');
+    const selects = [
+        document.getElementById('project-filter-city'),
+        document.getElementById('project-filter-location'),
+        document.getElementById('project-filter-implementation-date')
+    ].filter(Boolean);
+
+    if (nameSearch && !nameSearch.dataset.projectFilterBound) {
+        nameSearch.dataset.projectFilterBound = 'true';
+        nameSearch.addEventListener('input', applyProjectFilters);
+    }
+    selects.forEach(select => {
+        if (select.dataset.projectFilterBound) return;
+        select.dataset.projectFilterBound = 'true';
+        select.addEventListener('change', applyProjectFilters);
+    });
+
+    updateProjectFilterOptions();
+    applyProjectFilters();
+}
+
+async function loadProjectData() {
+    const buffer = await loadXlsxArrayBuffer(PROJECT_DATA_URL);
+    const workbook = await XLSXLite.read(buffer);
+    const sheetName = (workbook.sheetNames || [])[0];
+    if (!sheetName || !workbook.sheets[sheetName]) {
+        throw new Error('File Data project.xlsx tidak memiliki sheet yang dapat dibaca.');
+    }
+
+    const rows = XLSXLite.sheetToObjects(workbook.sheets[sheetName]);
+    const headers = new Set(Object.keys(rows[0] || {}));
+    const projectNameHeader = headers.has('Nama Project') ? 'Nama Project' : 'Project';
+    const implementationDateHeader = [...headers].find(header =>
+        String(header).trim().toLowerCase() === 'tanggal implementasi'
+    );
+    const requiredHeaders = [projectNameHeader, 'Lokasi Project', 'Latitude', 'Longitude'];
+    const missingHeaders = requiredHeaders.filter(header => !headers.has(header));
+    if (!implementationDateHeader) missingHeaders.push('Tanggal implementasi');
+    if (missingHeaders.length) {
+        throw new Error(`Kolom wajib tidak ditemukan di Data project.xlsx: ${missingHeaders.join(', ')}.`);
+    }
+
+    const parsedProjects = rows.map(row => {
+        const latitude = Number.parseFloat(String(row.Latitude ?? '').replace(',', '.'));
+        const longitude = Number.parseFloat(String(row.Longitude ?? '').replace(',', '.'));
+        return {
+            city: String(row.City ?? '').trim(),
+            name: String(row[projectNameHeader] ?? '').trim(),
+            location: String(row['Lokasi Project'] ?? '').trim(),
+            implementationDate: String(row[implementationDateHeader] ?? '').trim(),
+            pic: String(row['Nama PIC'] ?? '').trim(),
+            workStatus: String(row['Status Pekerjaan'] ?? '').trim(),
+            latitude,
+            longitude,
+            rackUrl: row['Data rack'],
+            documentationUrl: row['Link dokumentasi']
+        };
+    }).filter(project => project.name);
+    const invalidCoordinates = parsedProjects.filter(project =>
+        Number.isFinite(project.latitude) &&
+        Number.isFinite(project.longitude) &&
+        Math.abs(project.latitude) <= 90 &&
+        Math.abs(project.longitude) <= 180
+    );
+    if (invalidCoordinates.length !== parsedProjects.length) {
+        throw new Error(`${parsedProjects.length - invalidCoordinates.length} project memiliki koordinat yang tidak valid di Data project.xlsx.`);
+    }
+    projectRecords = invalidCoordinates.sort((first, second) => {
+        const firstDate = getProjectDateTimestamp(first.implementationDate);
+        const secondDate = getProjectDateTimestamp(second.implementationDate);
+        if (firstDate === null) return secondDate === null ? 0 : 1;
+        if (secondDate === null) return -1;
+        return secondDate - firstDate;
+    });
+
+    if (projectRecords.length === 0) {
+        throw new Error('Tidak ada baris project dengan nama dan koordinat yang valid.');
+    }
+
+    filteredProjectRecords = projectRecords.slice();
+    const features = createProjectFeatures(filteredProjectRecords);
+
+    if (projectLayer) map.removeLayer(projectLayer);
+    projectLayer = new ol.layer.Vector({
+        source: new ol.source.Vector({ features }),
+        style: feature => {
+            const projects = feature.get('projects') || [];
+            const emojis = [...new Set(projects.flatMap(project => getProjectLocationEmojis(project.location)))].join('') || '📍';
+            const locations = [...new Set(projects.map(project => getProjectLocationLabel(project.location)).filter(Boolean))].join(' / ');
+            return [
+                new ol.style.Style({
+                    image: new ol.style.Circle({
+                        radius: 16,
+                        fill: new ol.style.Fill({ color: '#1769aa' }),
+                        stroke: new ol.style.Stroke({ color: '#ffffff', width: 3 })
+                    }),
+                    text: new ol.style.Text({
+                        text: emojis,
+                        font: '18px "Segoe UI Emoji", sans-serif',
+                        textAlign: 'center',
+                        textBaseline: 'middle'
+                    })
+                }),
+                new ol.style.Style({
+                    text: new ol.style.Text({
+                        text: locations,
+                        offsetY: 28,
+                        fill: new ol.style.Fill({ color: '#ffffff' }),
+                        stroke: new ol.style.Stroke({ color: '#1769aa', width: 3 }),
+                        font: 'bold 12px Arial'
+                    })
+                })
+            ];
+        },
+        zIndex: 100001
+    });
+    projectLayer.set('title', 'Project');
+    projectLayer.set('interactive', false);
+    map.addLayer(projectLayer);
+    setupProjectFilters();
+    map.getView().fit(projectLayer.getSource().getExtent(), {
+        padding: [100, 40, 100, 365],
+        maxZoom: 16,
+        duration: 0
+    });
+    console.log(`[CUSTOMER_MAP] Loaded ${projectRecords.length} project row(s) at ${features.length} map location(s).`);
+}
+
+function showProjectPopup(feature) {
+    const popup = document.getElementById('popup-content');
+    const projects = feature.get('projects') || [];
+    if (!popup || projects.length === 0) return;
+
+    popup.innerHTML = `
+        <div class="project-popup">
+            <strong>Data Project</strong>
+            ${groupProjectsByName(projects).map(projectGroup => {
+                const project = projectGroup[0];
+                const milestones = sortProjectMilestones(projectGroup);
+                const milestoneDetails = milestones.length > 1
+                    ? milestones.map(milestone => `
+                        <div>Tanggal implementasi: ${escapeHtml(milestone.implementationDate || '-')}</div>
+                        <div>Status Pekerjaan: ${escapeHtml(milestone.workStatus || '-')}</div>
+                    `).join('')
+                    : `
+                        <div>Tanggal implementasi: ${escapeHtml(project.implementationDate || '-')}</div>
+                        <div>Status Pekerjaan: ${escapeHtml(project.workStatus || '-')}</div>
+                    `;
+                return `
+                <div class="project-popup-item">
+                    <strong>Nama Project: ${escapeHtml(project.name || '-')}</strong>
+                    <div>Nama PIC: ${escapeHtml(project.pic || '-')}</div>
+                    <div>Lokasi Project: ${escapeHtml(project.location || '-')}</div>
+                    ${milestoneDetails}
+                    <div class="project-action-buttons">
+                        ${projectLinkButton(project.rackUrl, 'Data rack')}
+                        ${projectLinkButton(project.documentationUrl, 'Link dokumentasi')}
+                    </div>
+                </div>
+            `;
+            }).join('')}
+            <button type="button" class="project-popup-data-button">Lihat Data Project</button>
+        </div>
+    `;
+
+    if (typeof container !== 'undefined') container.style.display = 'block';
+    if (typeof overlayPopup !== 'undefined') {
+        overlayPopup.setPosition(feature.getGeometry().getCoordinates());
+    }
+}
+
+function showCustomerPopup(customer, feature) {
+
+    const popup =
+        document.getElementById(
+            "popup-content"
+        );
+
+    let gps = "";
+
+    if (
+Number.isFinite(customer.latitude) &&
+Number.isFinite(customer.longitude)
+    ) {
+
+        gps =
+            `
+            <a
+                class="gps-button"
+                target="_blank"
+                href="https://www.google.com/maps/dir/?api=1&destination=${customer.latitude},${customer.longitude}"
+            >
+                🧍🏿 Buka GPS / Google Maps
+            </a>
+            `;
+
+    }
+
+    const idDisplay = customer.id || '';
+    const rawFatData = customer.dataFatFull && typeof customer.dataFatFull === 'object'
+        ? customer.dataFatFull
+        : {};
+    const normalizeRawHeader = value => normalize(value)
+        .toLowerCase()
+        .replace(/_/g, ' ')
+        .replace(/[^a-z0-9 ]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const rawFieldAliases = {
+        'survey date': ['survey date', 'update fat'],
+        'update fat': ['update fat', 'update fdt', 'survey date', 'tanggal fat', 'tanggal'],
+        'update fdt': ['update fdt', 'update fat', 'survey date'],
+        'update installation': ['update installation', 'installation date'],
+        'total used': ['total used', 'total used (visual)', 'total used visual'],
+        'total idle': ['total idle', 'total idle (visual)', 'total idle visual'],
+        'status fat': ['status fat', 'status fdt', 'status port', 'status'],
+        'status fdt': ['status fdt', 'status fat', 'status port', 'status'],
+        'province': ['province', 'provinsi'],
+        'ioh business area': ['ioh business area', 'business area'],
+        'cluster name': ['cluster name'],
+        'source data': ['source data', 'sourch data'],
+        'fat code old': ['fat code old', 'label fat old', 'label fat new', 'fdt code survey'],
+        'check id fat': ['check id fat', 'check id fdt'],
+        'fat latitude': ['fat latitude', 'fdt latitude', 'latitude'],
+        'fat longitude': ['fat longitude', 'fdt longitude', 'longitude'],
+        'site id': ['site id', 'siteid']
+    };
+    const findRawKey = header => {
+        const normalizedHeader = normalizeRawHeader(header);
+        const keys = rawFieldAliases[normalizedHeader] || [normalizedHeader];
+        return Object.keys(rawFatData).find(item => keys.includes(normalizeRawHeader(item)));
+    };
+    const getRawHeader = header => findRawKey(header) || header;
+    const getRawValue = header => {
+        const key = findRawKey(header);
+        return key ? rawFatData[key] : '';
+    };
+    const displayValue = value => {
+        const text = String(value ?? '').trim();
+        return text ? escapeHtml(text) : '-';
+    };
+    const isFdt = String(customer.dataType || '').toUpperCase() === 'FDT';
+    const markerDetails = [
+        ['CITY', getRawValue('CITY') || customer.city],
+        ['PROVINCE', getRawValue('PROVINCE')],
+        ['SITE ID', getRawValue('SITE ID') || customer.siteId],
+        ['IOH BUSINESS AREA', getRawValue('IOH BUSINESS AREA')],
+        ['CLUSTER NAME', getRawValue('CLUSTER NAME')],
+        [
+            isFdt ? 'FDT CODE SURVEY' : 'FAT CODE OLD',
+            getRawValue(isFdt ? 'FDT CODE SURVEY' : 'FAT CODE OLD') || customer.label || customer.username || idDisplay
+        ],
+        [isFdt ? 'Check ID FDT' : 'Check ID FAT', getRawValue(isFdt ? 'Check ID FDT' : 'Check ID FAT') || customer.id],
+        [isFdt ? 'FDT LATITUDE' : 'FAT LATITUDE', getRawValue(isFdt ? 'FDT LATITUDE' : 'FAT LATITUDE') || customer.latitude],
+        [isFdt ? 'FDT LONGITUDE' : 'FAT LONGITUDE', getRawValue(isFdt ? 'FDT LONGITUDE' : 'FAT LONGITUDE') || customer.longitude],
+        [isFdt ? 'Update FDT' : 'Update FAT', getRawValue(isFdt ? 'Update FDT' : 'Update FAT')],
+        ...(isFdt ? [
+            [getRawHeader('Source Data'), getRawValue('Source Data')]
+        ] : [
+            ['Update Installation', getRawValue('Update Installation')],
+            [getRawHeader('Source Data'), getRawValue('Source Data')]
+        ])
+    ];
+    const markerRows = markerDetails.map(([label, value]) => `
+                <tr>
+                    <td>${escapeHtml(label)}</td>
+                    <td>${displayValue(value)}</td>
+                </tr>
+    `).join('');
+    const portDetails = [
+        ...(isFdt ? [['Jumlah Splitter', getRawValue('Jumlah Splitter')]] : []),
+        ['Total Port', getRawValue('Total Port')],
+        ['Total Used', getRawValue('Total Used')],
+        ['Total Idle', getRawValue('Total Idle')],
+        [
+            getRawHeader(isFdt ? 'Status FDT' : 'Status FAT'),
+            getRawValue(isFdt ? 'Status FDT' : 'Status FAT') || customer.status
+        ]
+    ];
+    const portHeaders = portDetails.map(([label]) =>
+        `<th scope="col">${escapeHtml(label)}</th>`
+    ).join('');
+    const portValues = portDetails.map(([, value]) =>
+        `<td>${displayValue(value)}</td>`
+    ).join('');
+
+    popup.innerHTML = `
+
+        <div class="customer-popup">
+            <table>
+                ${markerRows}
+            </table>
+            <div class="fat-details-table-scroll">
+                <table class="fat-details-table">
+                    <thead><tr>${portHeaders}</tr></thead>
+                    <tbody><tr>${portValues}</tr></tbody>
+                </table>
+            </div>
+            ${gps}
+
+        </div>
+
+    `;
+
+    try {
+        if (typeof container !== 'undefined') container.style.display = 'block';
+        if (typeof overlayPopup !== 'undefined') {
+            overlayPopup.setPosition(
+                ol.proj.fromLonLat([
+                    customer.longitude,
+                    customer.latitude
+                ])
+            );
+        }
+
+    } catch (e) { console.warn('showCustomerPopup overlay error', e); }
+
+}
+
+
+/* =========================================================
+   MAP CLICK
+   ========================================================= */
+
+// =========================================================
+// DEVICE GEOLOCATION (show current device location on map)
+// =========================================================
+function createUserLocationLayer() {
+    try {
+        if (userLocationLayer) return;
+        if (typeof ol === 'undefined' || typeof map === 'undefined') return;
+        userLocationLayer = new ol.layer.Vector({
+            source: new ol.source.Vector(),
+            zIndex: 2147483646,
+            style: function(feature) {
+                try {
+                    if (!feature) return null;
+                    const t = feature.get('type');
+                    if (t === 'accuracy') {
+                        return new ol.style.Style({
+                            fill: new ol.style.Fill({ color: 'rgba(33,150,243,0.12)' }),
+                            stroke: new ol.style.Stroke({ color: 'rgba(33,150,243,0.35)', width: 1 })
+                        });
+                    }
+                    return null;
+                } catch (e) { return null; }
+            }
+        });
+        try { map.addLayer(userLocationLayer); } catch (e) { console.warn('createUserLocationLayer addLayer failed', e); }
+    } catch (e) { console.warn('createUserLocationLayer failed', e); }
+}
+
+function createUserLocationOverlay() {
+    if (userLocationOverlay) return;
+    userLocationOverlay = createMapEmojiOverlay(
+        '🧍🏿',
+        'user-location-marker',
+        'user-location-marker-anchor',
+        coordinates => {
+            if (userLocationFeature) userLocationFeature.getGeometry().setCoordinates(coordinates);
+            if (userLocationAccuracyFeature) {
+                const geometry = userLocationAccuracyFeature.getGeometry();
+                if (geometry instanceof ol.geom.Circle) geometry.setCenter(coordinates);
+            }
+        }
+    );
+    map.addOverlay(userLocationOverlay);
+}
+
+function createMapEmojiOverlay(emoji, markerClass, anchorClass, onPositionChange) {
+    const marker = document.createElement('div');
+    marker.className = anchorClass;
+    marker.setAttribute('aria-hidden', 'true');
+    const icon = document.createElement('span');
+    icon.className = markerClass;
+    icon.textContent = emoji;
+    icon.style.pointerEvents = 'auto';
+    icon.style.cursor = 'grab';
+    icon.style.touchAction = 'none';
+    marker.appendChild(icon);
+    const overlay = new ol.Overlay({
+        element: marker,
+        positioning: 'bottom-center',
+        stopEvent: false
+    });
+
+    let activePointerId = null;
+    icon.addEventListener('pointerdown', event => {
+        if (event.button !== undefined && event.button !== 0) return;
+        activePointerId = event.pointerId;
+        icon.style.cursor = 'grabbing';
+        event.preventDefault();
+        event.stopPropagation();
+        if (icon.setPointerCapture) icon.setPointerCapture(event.pointerId);
+    });
+
+    icon.addEventListener('pointermove', event => {
+        if (event.pointerId !== activePointerId) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const coordinates = map.getEventCoordinate(event);
+        overlay.setPosition(coordinates);
+        if (typeof onPositionChange === 'function') onPositionChange(coordinates);
+    });
+
+    const finishOverlayDrag = event => {
+        if (event.pointerId !== activePointerId) return;
+        event.preventDefault();
+        event.stopPropagation();
+        activePointerId = null;
+        icon.style.cursor = 'grab';
+        if (icon.hasPointerCapture && icon.hasPointerCapture(event.pointerId)) {
+            icon.releasePointerCapture(event.pointerId);
+        }
+    };
+    icon.addEventListener('pointerup', finishOverlayDrag);
+    icon.addEventListener('pointercancel', finishOverlayDrag);
+
+    return overlay;
+}
+
+function showUserLocation(latitude, longitude, accuracyMeters) {
+    try {
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+        createUserLocationLayer();
+        if (!userLocationLayer) return;
+        const src = userLocationLayer.getSource();
+        try { src.clear(); } catch (e) {}
+        const coords = ol.proj.fromLonLat([Number(longitude), Number(latitude)]);
+        userLocationFeature = new ol.Feature({ geometry: new ol.geom.Point(coords), type: 'position' });
+        // Use ol.geom.Circle for accuracy (works in view projection units) — transform lonlat to map projection; provide radius in meters by approximating with ol.Sphere if desired.
+        // Simpler: create a circle geometry in map projection by using ol.geom.Circle
+        userLocationAccuracyFeature = new ol.Feature({});
+        try {
+            const accuracyGeom = new ol.geom.Circle(coords, Number(accuracyMeters) || 0);
+            userLocationAccuracyFeature.setGeometry(accuracyGeom);
+            userLocationAccuracyFeature.set('type', 'accuracy');
+        } catch (e) {
+            try { userLocationAccuracyFeature.setGeometry(null); } catch (ee) {}
+        }
+        try { if (userLocationAccuracyFeature) src.addFeature(userLocationAccuracyFeature); } catch (e) {}
+        try { if (userLocationFeature) src.addFeature(userLocationFeature); } catch (e) {}
+        createUserLocationOverlay();
+        userLocationOverlay.setPosition(coords);
+        try {
+            const view = map.getView();
+            if (view) {
+                try { view.animate({ center: coords, zoom: Math.max(view.getZoom() || 12, 15), duration: 500 }); } catch (e) { }
+            }
+        } catch (e) {}
+    } catch (e) { console.warn('showUserLocation failed', e); }
+}
+
+function clearUserLocation() {
+    try {
+        if (userLocationLayer) {
+            const src = userLocationLayer.getSource();
+            if (src && typeof src.clear === 'function') src.clear();
+        }
+        if (userLocationOverlay) userLocationOverlay.setPosition(undefined);
+        userLocationFeature = null; userLocationAccuracyFeature = null;
+    } catch (e) { console.warn('clearUserLocation failed', e); }
+}
+
+function setupGeolocateControl() {
+    try {
+        if (setupGeolocateControl._initialized) return;
+        setupGeolocateControl._initialized = true;
+        if (document.getElementById('geolocate-btn')) return;
+
+        function setButtonContent(icon, label) {
+            const iconElement = document.createElement('span');
+            iconElement.className = 'geolocate-button-icon';
+            iconElement.textContent = icon;
+            const labelElement = document.createElement('span');
+            labelElement.textContent = label;
+            btn.replaceChildren(iconElement, labelElement);
+        }
+
+        const btn = document.createElement('button');
+        btn.id = 'geolocate-btn';
+        btn.type = 'button';
+        btn.style.background = '#007bff';
+        btn.style.color = '#fff';
+        btn.style.border = 'none';
+        btn.style.padding = '6px 12px';
+        btn.style.borderRadius = '6px';
+        btn.style.cursor = 'pointer';
+        btn.style.fontSize = '13px';
+        btn.style.whiteSpace = 'nowrap';
+        btn.style.height = 'auto';
+        btn.style.width = 'auto';
+        btn.style.lineHeight = 'normal';
+        btn.style.display = 'flex';
+        btn.style.alignItems = 'center';
+        btn.style.gap = '6px';
+        setButtonContent('📡', 'Lokasi Anda');
+        btn.addEventListener('click', function() {
+            try {
+                if (!('geolocation' in navigator)) { alert('Perangkat tidak mendukung Geolocation'); return; }
+                btn.disabled = true;
+                setButtonContent('📡', 'Mencari...');
+                navigator.geolocation.getCurrentPosition(function(pos) {
+                    try {
+                        const lat = pos.coords.latitude;
+                        const lon = pos.coords.longitude;
+                        const acc = pos.coords.accuracy || 0;
+                        showUserLocation(lat, lon, acc);
+                    } catch (e) { console.warn('geolocation success handler failed', e); }
+                    btn.disabled = false;
+                    setButtonContent('📡', 'Lokasi Anda');
+                }, function(err) {
+                    console.warn('geolocation error', err);
+                    alert('Gagal mendapatkan lokasi: ' + (err && err.message ? err.message : 'Unknown'));
+                    btn.disabled = false;
+                    setButtonContent('📡', 'Lokasi Anda');
+                }, { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+            } catch (e) {
+                console.warn('geolocate click handler failed', e);
+                btn.disabled = false;
+                setButtonContent('📡', 'Lokasi Anda');
+            }
+        });
+
+        // Create an OL control element so it sits inside the map's control area (bottom-right)
+        const wrapper = document.createElement('div');
+        wrapper.id = 'geolocate-wrapper';
+        wrapper.className = 'geolocate-control';
+        wrapper.style.cssText = 'position:absolute; bottom:40px; right:8px; z-index:100; background:rgba(255,255,255,0.7); border-radius:6px; padding:2px;';
+        wrapper.appendChild(btn);
+
+        if (typeof map !== 'undefined' && map && typeof ol !== 'undefined' && ol.control) {
+            map.addControl(new ol.control.Control({ element: wrapper }));
+            console.log('setupGeolocateControl: added as OL control');
+        } else {
+            // fallback: append to body at bottom-right
+            wrapper.style.position = 'fixed';
+            wrapper.style.bottom = '16px';
+            wrapper.style.right = '16px';
+            document.body.appendChild(wrapper);
+        }
+        // Initially hide button only on mobile where dashboard covers the map
+        try {
+            const db = document.getElementById('dashboard');
+            const isMobile = window.innerWidth <= 768;
+            if (isMobile && db && window.getComputedStyle(db).display !== 'none') {
+                wrapper.style.display = 'none';
+            }
+        } catch(e) {}
+    } catch (e) { console.warn('setupGeolocateControl failed', e); }
+}
+
+
+
+function showPolygonPopup(feature) {
+    try {
+        const popup = document.getElementById('popup-content');
+        if (!popup) return;
+        // Try to compute interior coordinate for positioning
+        let pos = getFeatureInteriorCoordinate(feature);
+        if (!pos) {
+            const geom = feature.getGeometry && feature.getGeometry();
+            if (geom) {
+                try {
+                    const center = ol.extent.getCenter(geom.getExtent());
+                    const maybe = maybeLonLat(center);
+                    if (maybe) pos = { latitude: maybe.latitude, longitude: maybe.longitude };
+                } catch (e) {}
+            }
+        }
+
+        const ward = feature.get('Ward') || feature.get('WARD') || feature.get('ward') || '';
+        const district = feature.get('District') || feature.get('DISTRICT') || feature.get('district') || '';
+        const city = feature.get('City') || feature.get('CITY') || feature.get('city') || '';
+
+        popup.innerHTML = `
+            <div class="customer-popup">
+                <table>
+                    <tr><td>Ward</td><td>${escapeHtml(ward)}</td></tr>
+                    <tr><td>District</td><td>${escapeHtml(district)}</td></tr>
+                    <tr><td>City</td><td>${escapeHtml(city)}</td></tr>
+                </table>
+            </div>
+        `;
+
+        try {
+            if (typeof container !== 'undefined') container.style.display = 'block';
+            if (typeof overlayPopup !== 'undefined' && pos) {
+                overlayPopup.setPosition(ol.proj.fromLonLat([pos.longitude, pos.latitude]));
+            }
+        } catch (e) { console.warn('showPolygonPopup overlay error', e); }
+    } catch (e) { console.warn('showPolygonPopup error', e); }
+}
+
+function getEditedCustomers() {
+    try {
+        if (!Array.isArray(customers)) return [];
+        return customers.filter(c => c && c.__edited === true);
+    } catch (e) { console.warn('getEditedCustomers failed', e); return []; }
+}
+
+function exportEditedCustomersCSV(edited) {
+    try {
+        if (!Array.isArray(edited) || edited.length === 0) return null;
+        const keysSet = new Set();
+        edited.forEach(obj => { Object.keys(obj || {}).forEach(k => { if (k !== '__edited') keysSet.add(k); }); });
+        const keys = Array.from(keysSet);
+        const escapeCell = v => {
+            if (v === null || v === undefined) return '';
+            const s = String(v);
+            const sEsc = s.replace(/"/g, '""');
+            if (sEsc.includes(',') || sEsc.includes('"') || sEsc.includes('\n')) return '"' + sEsc + '"';
+            return sEsc;
+        };
+        const header = keys.join(',');
+        const rows = edited.map(obj => keys.map(k => escapeCell(obj[k])).join(',')).join('\n');
+        return header + '\n' + rows;
+    } catch (e) { console.warn('exportEditedCustomersCSV failed', e); return null; }
+}
+
+function downloadFile(filename, text) {
+    try {
+        const blob = new Blob([text], { type: 'text/csv;charset=utf-8;' });
+        if (window.navigator && window.navigator.msSaveOrOpenBlob) { window.navigator.msSaveOrOpenBlob(blob, filename); return; }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); setTimeout(() => { try { document.body.removeChild(a); } catch (e) {} URL.revokeObjectURL(url); }, 100);
+    } catch (e) { console.warn('downloadFile failed', e); }
+}
+
+function setupSaveEditsCSVControl() { return; // disabled: CSV is saved automatically from popup edits
+
+    try {
+        if (setupSaveEditsCSVControl._initialized) return;
+        setupSaveEditsCSVControl._initialized = true;
+        if (document.getElementById('save-edits-csv-btn')) return;
+        const btn = document.createElement('button');
+        btn.id = 'save-edits-csv-btn';
+        btn.type = 'button';
+        btn.textContent = '💾 Save edits (CSV)';
+        btn.style.position = 'fixed';
+        btn.style.right = '16px';
+        btn.style.bottom = '72px';
+        btn.style.zIndex = '2147483647';
+        btn.style.background = '#28a745';
+        btn.style.color = '#fff';
+        btn.style.border = 'none';
+        btn.style.padding = '10px 14px';
+        btn.style.borderRadius = '6px';
+        btn.style.cursor = 'pointer';
+        btn.addEventListener('click', function() {
+            try {
+                const edited = getEditedCustomers();
+                if (!edited || edited.length === 0) { alert('Tidak ada perubahan yang perlu disimpan.'); return; }
+                const csv = exportEditedCustomersCSV(edited);
+                if (!csv) { alert('Gagal membuat CSV. Periksa console untuk detail.'); return; }
+                const filename = 'edited_customers_' + (new Date()).toISOString().replace(/[:.]/g, '-') + '.csv';
+                downloadFile(filename, csv);
+            } catch (e) { console.warn('save edits dl handler failed', e); alert('Gagal melakukan download.'); }
+        });
+        document.body.appendChild(btn);
+    } catch (e) { console.warn('setupSaveEditsCSVControl failed', e); }
+}
+
+function setupMapClick() {
+    if (setupMapClick._initialized) return;
+    setupMapClick._initialized = true;
+
+    map.on('singleclick', function(event) {
+        if (coordinateRulerActive) return;
+
+        // Collect all features at the clicked pixel so we can prefer customer markers over polygons
+        const hits = [];
+        map.forEachFeatureAtPixel(event.pixel, function(feature, layer) {
+            hits.push({ feature, layer });
+        });
+
+        if (!hits || hits.length === 0) return;
+
+
+        // Prefer project markers, then customer markers, over boundary polygons.
+        let chosen = null;
+        for (const h of hits) {
+            try {
+                if (h.feature && h.feature.get && Array.isArray(h.feature.get('projects'))) {
+                    chosen = h.feature;
+                    break;
+                }
+            } catch(e) {}
+        }
+        for (const h of hits) {
+            if (chosen) break;
+            try { if (h.feature && h.feature.get && h.feature.get('customer')) { chosen = h.feature; break; } } catch(e){}
+        }
+
+        // If no customer found, prefer ward/district polygon features
+        if (!chosen) {
+            for (const h of hits) {
+                try {
+                    const f = h.feature;
+                    if (!f || !f.get) continue;
+                    const hasWard = f.get('Ward') || f.get('WARD') || f.get('ward');
+                    const hasDistrict = f.get('District') || f.get('DISTRICT') || f.get('district');
+                    if (hasWard || hasDistrict) { chosen = f; break; }
+                } catch(e) {}
+            }
+        }
+
+        // fallback to first hit
+        if (!chosen) chosen = hits[0].feature;
+
+        if (!chosen) return;
+
+        // Show the popup that matches the selected marker type.
+        try {
+            const customer = chosen.get && chosen.get('customer');
+            const projects = chosen.get && chosen.get('projects');
+            if (Array.isArray(projects)) {
+                showProjectPopup(chosen);
+            } else if (customer) {
+                showCustomerPopup(customer, chosen);
+            } else {
+                showPolygonPopup(chosen);
+            }
+        } catch (e) { console.warn('setupMapClick handler error', e); }
+
+    });
+
+}
+
+
+/* =========================================================
+   UNIQUE VALUES
+   ========================================================= */
+
+function uniqueValues(
+    data,
+    field
+) {
+
+    return [
+        ...new Set(
+
+            data
+                .map(
+                    item =>
+normalize(
+                            item[field]
+                        )
+                )
+                .filter(Boolean)
+
+        )
+    ]
+    .sort(
+        (a, b) =>
+            a.localeCompare(
+                b,
+                "id"
+            )
+    );
+
+}
+
+function getCustomerClusterName(customer) {
+    const raw = customer?.dataFatFull;
+    if (!raw || typeof raw !== "object") return "";
+    const key = Object.keys(raw).find(header =>
+        normalize(header).toLowerCase().replace(/_/g, " ") === "cluster name"
+    );
+    return key ? normalize(raw[key]) : "";
+}
+
+function getSiteValues(city) {
+    const cacheKey = city || "";
+    if (!siteValuesCache.has(cacheKey)) {
+        const data = city ? customers.filter(customer => customer.city === city) : customers;
+        const clusterNames = data.map(getCustomerClusterName).filter(Boolean);
+        siteValuesCache.set(cacheKey, [...new Set(clusterNames)]
+            .sort((a, b) => a.localeCompare(b, "id")));
+    }
+    return siteValuesCache.get(cacheKey);
+}
+
+
+/* =========================================================
+   FILL SELECT
+   ========================================================= */
+
+function fillSelect(
+    id,
+    values,
+    firstText
+) {
+
+    const select =
+        document.getElementById(id);
+
+    if (!select)
+        return;
+
+    select.innerHTML =
+        `<option value="">
+            ${firstText}
+        </option>`;
+
+    values.forEach(value => {
+
+        const option =
+            document.createElement(
+                "option"
+            );
+
+        option.value = value;
+
+        option.textContent =
+            value;
+
+        select.appendChild(
+            option
+        );
+
+    });
+
+}
+
+function renderSiteDropdown(values, selectedValue) {
+    const toggle = document.getElementById("filter-site-toggle");
+    const options = document.getElementById("filter-site-options");
+    const search = document.getElementById("filter-site-search");
+    if (!toggle || !options || !search) return;
+
+    toggle.textContent = selectedValue || "Semua Cluster Name";
+    const query = normalize(search.value).toLowerCase();
+    const matchingValues = query
+        ? values.filter(value => normalize(value).toLowerCase().includes(query))
+        : [];
+    const visibleValues = matchingValues.slice(0, MAX_SITE_DROPDOWN_OPTIONS);
+
+    options.replaceChildren();
+    const fragment = document.createDocumentFragment();
+    const addOption = value => {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = "site-dropdown-option";
+        option.setAttribute("role", "option");
+        option.setAttribute("aria-selected", String(value === selectedValue));
+        option.textContent = value || "Semua Cluster Name";
+        option.addEventListener("click", () => {
+            const select = document.getElementById("filter-site");
+            if (select) {
+                let selectedOption = Array.from(select.options).find(item => item.value === value);
+                if (!selectedOption) {
+                    selectedOption = document.createElement("option");
+                    selectedOption.value = value;
+                    selectedOption.textContent = value || "Semua Cluster Name";
+                    select.appendChild(selectedOption);
+                }
+                select.value = value;
+            }
+            toggle.textContent = value || "Semua Cluster Name";
+            document.getElementById("filter-site-panel").hidden = true;
+            toggle.setAttribute("aria-expanded", "false");
+            search.value = "";
+            renderSiteDropdown(values, value);
+            applyFilters();
+            toggle.focus();
+        });
+        fragment.appendChild(option);
+    };
+
+    addOption("");
+    if (selectedValue && !visibleValues.includes(selectedValue)) {
+        addOption(selectedValue);
+    }
+    visibleValues.forEach(addOption);
+
+    if (!query && values.length > 0) {
+        const empty = document.createElement("div");
+        empty.className = "site-dropdown-option";
+        empty.textContent = "Ketik Cluster Name untuk mencari";
+        fragment.appendChild(empty);
+    } else if (query && matchingValues.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "site-dropdown-option";
+        empty.textContent = "Cluster Name tidak ditemukan";
+        fragment.appendChild(empty);
+    } else if (matchingValues.length > MAX_SITE_DROPDOWN_OPTIONS) {
+        const more = document.createElement("div");
+        more.className = "site-dropdown-option";
+        more.textContent = `Menampilkan ${MAX_SITE_DROPDOWN_OPTIONS} dari ${matchingValues.length}; perjelas pencarian`;
+        fragment.appendChild(more);
+    }
+    options.appendChild(fragment);
+}
+
+
+/* =========================================================
+   FILTER OPTIONS
+   ========================================================= */
+
+function updateFilters() {
+
+    const normalizeFilterValue = value => {
+        const normalized = normalize(value || "").toLowerCase();
+        if (normalized.startsWith("semua") || normalized.startsWith("all")) return "";
+        return value || "";
+    };
+
+    const city =
+        normalizeFilterValue(document.getElementById("filter-city")?.value || "");
+
+    const selectedSite =
+        normalizeFilterValue(document.getElementById("filter-site")?.value || "");
+
+    const selectedPortStatus =
+        normalizeFilterValue(document.getElementById("filter-port-status")?.value || "");
+
+    // Daftar kota/kabupaten dari seluruh data
+    const cityValues =
+        uniqueValues(customers, "city");
+
+    fillSelect(
+        "filter-city",
+        cityValues,
+        "Semua Kota/Kabupaten"
+    );
+
+    if (
+        city &&
+        cityValues.includes(city)
+    ) {
+        document.getElementById(
+            "filter-city"
+        ).value = city;
+    }
+
+    // Daftar nama site (dibatasi kota bila dipilih)
+    const siteValues = getSiteValues(city);
+
+    if (
+        selectedSite &&
+        siteValues.includes(selectedSite)
+    ) {
+        document.getElementById(
+            "filter-site"
+        ).value = selectedSite;
+    }
+    renderSiteDropdown(siteValues, selectedSite && siteValues.includes(selectedSite) ? selectedSite : "");
+
+    const portStatusSelect = document.getElementById("filter-port-status");
+    if (portStatusSelect) {
+        portStatusSelect.innerHTML = '<option value="">Semua Status Port</option>';
+        PORT_STATUS_FILTER_KEYS.forEach(key => {
+            const config = PORT_STATUS_CONFIG[key];
+            const option = document.createElement("option");
+            option.value = key;
+            option.textContent = config.label;
+            portStatusSelect.appendChild(option);
+        });
+
+        if (selectedPortStatus && PORT_STATUS_FILTER_KEYS.includes(selectedPortStatus)) {
+            portStatusSelect.value = selectedPortStatus;
+        }
+    }
+
+}
+
+/* =========================================================
+   APPLY FILTER
+   ========================================================= */
+
+/* =========================================================
+   SIDEBAR FILTER (dipakai peta & tabel data FAT/FDT)
+   ========================================================= */
+
+function getSidebarFilterState() {
+    const normalizeFilterValue = value => {
+        const normalized = normalize(value || "").toLowerCase();
+        if (normalized.startsWith("semua") || normalized.startsWith("all")) return "";
+        return value || "";
+    };
+    return {
+        city: normalizeFilterValue(document.getElementById("filter-city")?.value || ""),
+        site: normalizeFilterValue(document.getElementById("filter-site")?.value || ""),
+        portStatus: normalizeFilterValue(document.getElementById("filter-port-status")?.value || ""),
+        keyword: normalize(document.getElementById("search-label")?.value).toLowerCase()
+    };
+}
+
+function filterCustomersBySidebar(list, state) {
+    const filters = state || getSidebarFilterState();
+    const city = filters.city;
+    const site = filters.site;
+    const portStatus = filters.portStatus;
+    const keyword = filters.keyword;
+
+    return (Array.isArray(list) ? list : []).filter(c => {
+        const cPortStatus = getPortStatusKey(c);
+        const labelFatOld = normalize(c.dataFatFull?.["Label FAT OLD"]).toLowerCase();
+        const labelFatNew = normalize(c.dataFatFull?.["Label FAT NEW"]).toLowerCase();
+        return (
+            (!city || c.city === city)
+            && (!site || getCustomerClusterName(c) === site)
+            && (!portStatus || cPortStatus === portStatus)
+            && (!keyword
+                || normalize(c.label).toLowerCase().includes(keyword)
+                || labelFatOld.includes(keyword)
+                || labelFatNew.includes(keyword)
+                || normalize(c.id).toLowerCase().includes(keyword)
+                || normalize(c.site).toLowerCase().includes(keyword))
+        );
+    });
+}
+
+function applyFilters() {
+
+    const filters = getSidebarFilterState();
+    const keyword = filters.keyword;
+
+    const filtered = filterCustomersBySidebar(customers, filters);
+
+
+    // Marker individual per baris; popup tampilkan info FAT per marker
+    // Render every FAT record; each marker popup still shows only its clicked ID.
+    if ((keyword || filters.site) && filtered.length > 0) {
+        // Pencarian FAT/ODP atau pemilihan Cluster Name langsung memfokuskan hasil pada peta.
+        focusMapOnCustomers(filtered);
+        drawCustomers(filtered, { expandGroups: true, ignoreViewport: true });
+    } else {
+        drawCustomers(filtered, { expandGroups: true });
+    }
+
+    updateSummary(filtered);
+
+    updateChart(filtered);
+
+    updateODCChart(filtered);
+
+}
+
+/* =========================================================
+   SUMMARY
+   ========================================================= */
+
+function updateSummary(data) {
+
+    const total = document.getElementById("total-customer");
+    const ward = document.getElementById("total-ward");
+
+    // Total marker
+    const totalCustomer = data.length;
+
+    if (total) {
+        total.innerHTML = `${totalCustomer}`;
+    }
+
+    if (ward) {
+        ward.textContent = new Set(
+            data
+                .map(c => c.city)
+                .filter(Boolean)
+        ).size;
+    }
+
+}
+
+/* =========================================================
+   CHART PORT STATUS
+   ========================================================= */
+
+function updateChart(data) {
+    const statusCounts = new Map();
+    data.forEach(customer => {
+        const key = getPortStatusKey(customer);
+        statusCounts.set(key, (statusCounts.get(key) || 0) + 1);
+    });
+    // Chart FAT: hanya status non-ODC (ODC punya diagram terpisah)
+    const statusKeys = Object.keys(PORT_STATUS_CONFIG)
+        .filter(key => !ODC_STATUS_KEYS.includes(key) && statusCounts.has(key));
+    const labels = statusKeys.map(key => PORT_STATUS_CONFIG[key].label);
+    const counts = statusKeys.map(key => statusCounts.get(key));
+    const colors = statusKeys.map(key => PORT_STATUS_CONFIG[key].color);
+    const canvas =
+        document.getElementById(
+            "ward-chart"
+        );
+
+    if (!canvas || typeof Chart !== "function")
+        return;
+
+    if (wardChart)
+        wardChart.destroy();
+
+    wardChart = new Chart(
+            canvas,
+            {
+
+                type: "doughnut",
+
+                data: {
+                    labels,
+                    datasets: [
+                        {
+                            label: 'Jumlah FAT',
+                            data: counts,
+                            backgroundColor: colors,
+                            borderColor: '#ffffff',
+                            borderWidth: 2
+                        }
+                    ]
+                },
+
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    layout: {
+                        padding: { top: 8, right: 8, bottom: 12, left: 8 }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: context => {
+                                    const total = counts.reduce((sum, count) => sum + count, 0);
+                                    const percentage = total ? (context.raw / total * 100).toFixed(1) : '0.0';
+                                    return `${context.label}: ${context.raw} (${percentage}%)`;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        );
+
+    const legend = document.getElementById('legend');
+    if (legend) {
+        legend.innerHTML = statusKeys.map((key, index) => `
+            <div class="legend-item">
+                <span class="legend-color" style="background:${colors[index]}"></span>
+                <span>${escapeHtml(labels[index])}: ${counts[index]}</span>
+            </div>
+        `).join('');
+    }
+
+}
+
+/* =========================================================
+   CHART ODC (terpisah dari chart FAT)
+   ========================================================= */
+
+function updateODCChart(data) {
+    const statusCounts = new Map();
+    (Array.isArray(data) ? data : []).forEach(customer => {
+        const key = getPortStatusKey(customer);
+        if (!ODC_STATUS_KEYS.includes(key)) return;
+        statusCounts.set(key, (statusCounts.get(key) || 0) + 1);
+    });
+
+    const statusKeys = ODC_STATUS_KEYS.filter(key => statusCounts.has(key));
+    const labels = statusKeys.map(key => PORT_STATUS_CONFIG[key].label);
+    const counts = statusKeys.map(key => statusCounts.get(key));
+    const colors = statusKeys.map(key => PORT_STATUS_CONFIG[key].color);
+
+    const canvas = document.getElementById("odc-chart");
+    const legend = document.getElementById("odc-legend");
+    const totalODC = counts.reduce((sum, count) => sum + count, 0);
+
+    // Sembunyikan panel ODC bila tidak ada record ODC pada data aktif
+    const panel = document.getElementById("odc-chart-panel");
+    if (panel) panel.style.display = totalODC > 0 ? "" : "none";
+
+    if (!canvas || typeof Chart !== "function")
+        return;
+
+    if (odcChart)
+        odcChart.destroy();
+
+    if (totalODC === 0) {
+        odcChart = null;
+        if (legend) legend.innerHTML = "";
+        return;
+    }
+
+    odcChart = new Chart(
+        canvas,
+        {
+            type: "doughnut",
+            data: {
+                labels,
+                datasets: [
+                    {
+                        label: 'Jumlah ODC',
+                        data: counts,
+                        backgroundColor: colors,
+                        borderColor: '#ffffff',
+                        borderWidth: 2
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                layout: {
+                    padding: { top: 8, right: 8, bottom: 12, left: 8 }
+                },
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: context => {
+                                const percentage = totalODC ? (context.raw / totalODC * 100).toFixed(1) : '0.0';
+                                return `${context.label}: ${context.raw} (${percentage}%)`;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    );
+
+    if (legend) {
+        legend.innerHTML = statusKeys.map((key, index) => `
+            <div class="legend-item">
+                <span class="legend-color" style="background:${colors[index]}"></span>
+                <span>${escapeHtml(labels[index])}: ${counts[index]}</span>
+            </div>
+        `).join('');
+    }
+}
+
+
+/* =========================================================
+   LEGEND
+   ========================================================= */
+
+function updateLegend(count) {
+
+    const legend =
+        document.getElementById(
+            "legend"
+        );
+
+    if (!legend)
+        return;
+
+    legend.innerHTML = "";
+
+
+    Object.keys(
+        STATUS_CONFIG
+    ).forEach(key => {
+
+        const config =
+            STATUS_CONFIG[key];
+
+        const item =
+            document.createElement(
+                "div"
+            );
+
+        item.className =
+            "legend-item";
+
+
+        item.innerHTML = `
+
+            <span
+                class="legend-color"
+                style="
+                    background:${config.color}
+                "
+            ></span>
+
+            <span>
+                ${config.label}
+                :
+                ${count[key] || 0}
+            </span>
+
+        `;
+
+
+        legend.appendChild(
+            item
+        );
+
+    });
+
+}
+
+
+/* =========================================================
+   EVENTS
+   ========================================================= */
+
+function setupFilters() {
+ 
+if (setupFilters._isInitialized) return;
+setupFilters._isInitialized = true;
+ 
+const search = document.getElementById("search-label");
+const coordinateSearchForm = document.getElementById("coordinate-search-form");
+const coordinateSearchInput = document.getElementById("coordinate-search-input");
+const coordinateSearchMessage = document.getElementById("coordinate-search-message");
+const coordinateRulerButton = document.getElementById("coordinate-ruler-button");
+const siteDropdownToggle = document.getElementById("filter-site-toggle");
+const siteDropdownPanel = document.getElementById("filter-site-panel");
+const siteDropdownSearch = document.getElementById("filter-site-search");
+
+if (coordinateRulerButton) {
+    coordinateRulerButton.addEventListener("click", () => {
+        if (!coordinateSearchCoordinates) return;
+        coordinateRulerActive = !coordinateRulerActive;
+        coordinateRulerButton.setAttribute("aria-pressed", String(coordinateRulerActive));
+        coordinateRulerButton.textContent = coordinateRulerActive
+            ? "Selesai mengukur"
+            : "Ukur jarak dari pin";
+        if (coordinateRulerActive) {
+            if (coordinateRulerLayer) coordinateRulerLayer.getSource().clear();
+            coordinateRulerPoints = [ol.proj.fromLonLat(coordinateSearchCoordinates)];
+            coordinateRulerDistanceMeters = 0;
+            coordinateRulerLineFeature = null;
+            coordinateRulerLabelFeature = null;
+            const popup = document.getElementById("popup");
+            if (popup) popup.style.display = "none";
+            coordinateSearchMessage.textContent =
+                "Klik beberapa titik pada peta untuk membuat belokan. Klik Selesai mengukur jika sudah selesai.";
+            coordinateSearchMessage.style.color = "#1e293b";
+        } else {
+            if (coordinateRulerPoints.length > 1) {
+                updateCoordinateRulerDisplay();
+                coordinateSearchMessage.textContent =
+                    `Total jarak: ${formatCoordinateRulerDistance(coordinateRulerDistanceMeters)}`;
+            } else {
+                if (coordinateRulerLayer) coordinateRulerLayer.getSource().clear();
+                coordinateRulerLineFeature = null;
+                coordinateRulerLabelFeature = null;
+                coordinateSearchMessage.textContent = "Pengukuran selesai tanpa titik tujuan.";
+            }
+            coordinateSearchMessage.style.color = coordinateRulerPoints.length > 1 ? "#6b0606" : "#64748b";
+        }
+    });
+
+    map.on("singleclick", event => {
+        if (!coordinateRulerActive || !coordinateSearchCoordinates) return;
+
+        const destination = event.coordinate.slice();
+        const lastPoint = coordinateRulerPoints[coordinateRulerPoints.length - 1];
+        coordinateRulerDistanceMeters += getGreatCircleDistanceMeters(
+            ol.proj.toLonLat(lastPoint),
+            ol.proj.toLonLat(destination)
+        );
+        coordinateRulerPoints.push(destination);
+        updateCoordinateRulerDisplay();
+        coordinateRulerLayer.getSource().addFeature(new ol.Feature({
+            type: "vertex",
+            geometry: new ol.geom.Point(destination)
+        }));
+        coordinateSearchMessage.textContent =
+            `Total jarak: ${formatCoordinateRulerDistance(coordinateRulerDistanceMeters)}. Klik titik lain atau Selesai mengukur.`;
+        coordinateSearchMessage.style.color = "#6b0606";
+    });
+
+    map.on("pointermove", event => {
+        if (!coordinateRulerActive || event.dragging) return;
+        updateCoordinateRulerDisplay(event.coordinate);
+    });
+}
+
+if (coordinateSearchInput && coordinateRulerButton) {
+    coordinateSearchInput.addEventListener("input", () => {
+        coordinateSearchCoordinates = null;
+        coordinateRulerActive = false;
+        coordinateRulerButton.hidden = true;
+        coordinateRulerButton.disabled = true;
+        coordinateRulerButton.setAttribute("aria-pressed", "false");
+        coordinateRulerButton.textContent = "Ukur jarak dari pin";
+        coordinateRulerPoints = [];
+        coordinateRulerDistanceMeters = 0;
+        coordinateRulerLineFeature = null;
+        coordinateRulerLabelFeature = null;
+        if (coordinateRulerLayer) coordinateRulerLayer.getSource().clear();
+    });
+}
+
+if (coordinateSearchForm && coordinateSearchInput && coordinateSearchMessage) {
+    coordinateSearchForm.addEventListener("submit", event => {
+        event.preventDefault();
+        const values = coordinateSearchInput.value.trim().split(/[,\s]+/).filter(Boolean);
+        const latitude = Number(values[0]);
+        const longitude = Number(values[1]);
+        if (values.length !== 2 || !Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+            latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+            coordinateSearchMessage.textContent = "Koordinat tidak valid. Masukkan latitude, longitude (contoh: -7.2575, 112.7521).";
+            coordinateSearchMessage.style.color = "#b91c1c";
+            return;
+        }
+
+        coordinateSearchCoordinates = [longitude, latitude];
+        coordinateRulerActive = false;
+        coordinateRulerPoints = [];
+        coordinateRulerDistanceMeters = 0;
+        coordinateRulerLineFeature = null;
+        coordinateRulerLabelFeature = null;
+        if (coordinateRulerButton) {
+            coordinateRulerButton.disabled = false;
+            coordinateRulerButton.hidden = false;
+            coordinateRulerButton.setAttribute("aria-pressed", "false");
+            coordinateRulerButton.textContent = "Ukur jarak dari pin";
+        }
+        if (coordinateRulerLayer) coordinateRulerLayer.getSource().clear();
+        focusMapOnCoordinates(latitude, longitude);
+        coordinateSearchMessage.textContent = `Lokasi: ${latitude}, ${longitude} (radius ${COORDINATE_SEARCH_RADIUS_METERS} m)`;
+        coordinateSearchMessage.style.color = "#5f1105";
+    });
+}
+ 
+if (search) {
+    search.addEventListener("input", function () {
+        if (filterApplyTimer !== null) clearTimeout(filterApplyTimer);
+        filterApplyTimer = setTimeout(() => {
+            filterApplyTimer = null;
+            applyFilters();
+        }, 180);
+    });
+}
+
+if (siteDropdownToggle && siteDropdownPanel && siteDropdownSearch) {
+    siteDropdownToggle.addEventListener("click", () => {
+        const open = siteDropdownPanel.hidden;
+        siteDropdownPanel.hidden = !open;
+        siteDropdownToggle.setAttribute("aria-expanded", String(open));
+        if (open) {
+            siteDropdownSearch.value = "";
+            const siteSelect = document.getElementById("filter-site");
+            const citySelect = document.getElementById("filter-city");
+            const city = citySelect?.value || "";
+            const sites = getSiteValues(city);
+            renderSiteDropdown(sites, siteSelect?.value || "");
+            siteDropdownSearch.focus();
+        }
+    });
+    siteDropdownSearch.addEventListener("input", () => {
+        const siteSelect = document.getElementById("filter-site");
+        const city = document.getElementById("filter-city")?.value || "";
+        const sites = getSiteValues(city);
+        renderSiteDropdown(sites, siteSelect?.value || "");
+    });
+    document.addEventListener("click", event => {
+        const dropdown = document.getElementById("site-dropdown");
+        if (dropdown && !dropdown.contains(event.target)) {
+            siteDropdownPanel.hidden = true;
+            siteDropdownToggle.setAttribute("aria-expanded", "false");
+        }
+    });
+    siteDropdownSearch.addEventListener("keydown", event => {
+        if (event.key === "Escape") {
+            siteDropdownPanel.hidden = true;
+            siteDropdownToggle.setAttribute("aria-expanded", "false");
+            siteDropdownToggle.focus();
+        }
+    });
+}
+ 
+    const city =
+        document.getElementById(
+            "filter-city"
+        );
+
+    const site =
+        document.getElementById(
+            "filter-site"
+        );
+
+    const portStatus =
+        document.getElementById(
+            "filter-port-status"
+        );
+
+    if (city) {
+
+        city.addEventListener(
+            "change",
+            function() {
+
+                updateFilters();
+                applyFilters();
+
+            }
+        );
+
+    }
+
+    if (site) {
+
+        site.addEventListener(
+            "change",
+            applyFilters
+        );
+
+    }
+
+    if (portStatus) {
+        portStatus.addEventListener(
+            "change",
+            applyFilters
+        );
+    }
+
+}
+
+function downloadTextFile(filename, contents) {
+    try {
+        const blob = new Blob([contents], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }, 100);
+    } catch (e) {
+        console.warn('downloadTextFile failed', e);
+    }
+}
+
+function normalizeCsvHeader(line) {
+    return String(line ?? '')
+        .replace(/^\uFEFF/, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function mergeCsvContents(existingText, incomingText) {
+    const existingLines = String(existingText ?? '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line !== '');
+    const incomingLines = String(incomingText ?? '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line !== '');
+
+    if (incomingLines.length === 0) return existingLines.join('\n');
+    if (existingLines.length === 0) return incomingLines.join('\n');
+
+    const existingHeader = normalizeCsvHeader(existingLines[0]);
+    const incomingHeader = normalizeCsvHeader(incomingLines[0]);
+    const startIndex = (existingHeader && incomingHeader && existingHeader === incomingHeader) ? 1 : 0;
+    const appendedLines = incomingLines.slice(startIndex);
+    return existingLines.concat(appendedLines).join('\n');
+}
+
+function getGitHubRepoFromHost() {
+    const host = String(window.location.hostname || '').toLowerCase();
+    if (!host.endsWith('.github.io')) return null;
+    const owner = host.split('.')[0];
+    if (!owner) return null;
+    return { owner, repo: `${owner}.github.io` };
+}
+
+function getGitHubRepoInfo() {
+    const repoInfo = getGitHubRepoFromHost();
+    if (repoInfo) return repoInfo;
+    const input = prompt('Masukkan GitHub owner/repo untuk menyimpan data/customer.csv (contoh: owner/repo):');
+    if (!input) return null;
+    const parts = input.split('/').map(part => part.trim());
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+    return { owner: parts[0], repo: parts[1] };
+}
+
+function getGitHubToken() {
+    const storageKey = 'customerMapGitHubToken';
+    let token = localStorage.getItem(storageKey);
+    if (token) return token;
+    token = prompt('Masukkan GitHub Personal Access Token dengan akses repo (untuk menyimpan data/customer.csv):');
+    if (!token) return null;
+    token = String(token).trim();
+    if (token) {
+        localStorage.setItem(storageKey, token);
+        return token;
+    }
+    return null;
+}
+
+function base64EncodeUnicode(str) {
+    try {
+        return btoa(unescape(encodeURIComponent(str)));
+    } catch (e) {
+        return btoa(str);
+    }
+}
+
+function base64DecodeUnicode(str) {
+    try {
+        return decodeURIComponent(escape(atob(str)));
+    } catch (e) {
+        return atob(str);
+    }
+}
+
+async function saveCsvTextToGitHub(csvText, options = {}) {
+    const repoInfo = getGitHubRepoInfo();
+    if (!repoInfo) {
+        throw new Error('Tidak ada informasi repository GitHub.');
+    }
+    const token = getGitHubToken();
+    if (!token) {
+        throw new Error('Token GitHub diperlukan untuk menyimpan ke repository.');
+    }
+    const { owner, repo } = repoInfo;
+    const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+        headers: {
+            Authorization: `token ${token}`,
+            Accept: 'application/vnd.github+json'
+        }
+    });
+    if (!repoResponse.ok) {
+        const body = await repoResponse.text();
+        throw new Error('Gagal membaca repo GitHub: ' + repoResponse.status + ' ' + repoResponse.statusText + ' - ' + body);
+    }
+    const repoData = await repoResponse.json();
+    const branch = repoData.default_branch || 'main';
+    const path = 'data/customer.csv';
+    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+
+    let existingText = '';
+    let sha = null;
+    const fileResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(branch)}`, {
+        headers: {
+            Authorization: `token ${token}`,
+            Accept: 'application/vnd.github+json'
+        }
+    });
+    if (fileResponse.ok) {
+        const fileData = await fileResponse.json();
+        sha = fileData.sha;
+        if (fileData.content) {
+            existingText = base64DecodeUnicode(fileData.content.replace(/\n/g, ''));
+        }
+    } else if (fileResponse.status !== 404) {
+        const body = await fileResponse.text();
+        throw new Error('Gagal membaca file di repo: ' + fileResponse.status + ' ' + fileResponse.statusText + ' - ' + body);
+    }
+
+    const mergedText = (sha !== null) ? mergeCsvContents(existingText, csvText) : csvText;
+    const commitMessage = options.commitMessage || (sha !== null ? 'Append uploaded customer CSV to data/customer.csv' : 'Create data/customer.csv from uploaded CSV');
+    const putResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`, {
+        method: 'PUT',
+        headers: {
+            Authorization: `token ${token}`,
+            Accept: 'application/vnd.github+json',
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            message: commitMessage,
+            content: base64EncodeUnicode(mergedText),
+            branch,
+            sha: sha || undefined
+        })
+    });
+    if (!putResponse.ok) {
+        const body = await putResponse.text();
+        throw new Error('Gagal menyimpan file ke GitHub: ' + putResponse.status + ' ' + putResponse.statusText + ' - ' + body);
+    }
+    return { status: 'github', message: 'CSV berhasil ditambahkan ke GitHub repository.' };
+}
+
+async function saveCsvTextToServerOrDownload(csvText, options = {}) {
+    const append = Boolean(options.append);
+    const serverUrl = 'save_customer_csv.php' + (append ? '?append=1' : '');
+    try {
+        const response = await fetch(serverUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            body: csvText
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error('Server responded ' + response.status + ' ' + response.statusText + ': ' + text);
+        }
+
+        const body = await response.text();
+        if (String(body || '').trim() !== 'OK') {
+            throw new Error(String(body));
+        }
+
+        return { status: 'server', message: append ? 'CSV diunggah dan ditambahkan ke data/customer.csv' : 'CSV diunggah ke data/customer.csv' };
+    } catch (error) {
+        console.warn('saveCsvTextToServerOrDownload server save failed', error);
+        // Skip GitHub — langsung download file sebagai fallback
+        if (append) {
+            try {
+                const cacheBust = DATA_URL.includes('?') ? '&' : '?';
+                const existingResponse = await fetch(DATA_URL + cacheBust + 'v=' + Date.now());
+                if (!existingResponse.ok) {
+                    throw new Error('Fetch existing DATA_URL failed: ' + existingResponse.status + ' ' + existingResponse.statusText);
+                }
+                const existingText = await existingResponse.text();
+                const merged = mergeCsvContents(existingText, csvText);
+                downloadTextFile('customer.csv', merged);
+                return { status: 'download', message: 'Server tidak tersedia, file gabungan diunduh ke komputer Anda.' };
+            } catch (fallbackError) {
+                console.warn('saveCsvTextToServerOrDownload download fallback failed', fallbackError);
+                downloadTextFile('customer.csv', csvText);
+                return { status: 'download', message: 'Server tidak tersedia, CSV diunduh sebagai cadangan.' };
+            }
+        }
+
+        downloadTextFile('customer.csv', csvText);
+        return { status: 'download', message: 'Server tidak tersedia, CSV diunduh sebagai cadangan.' };
+    }
+}
+
+/* =========================================================
+   DASHBOARD BUTTON
+   ========================================================= */
+
+function setupDashboard() {
+    if (setupDashboard._initialized) return;
+    setupDashboard._initialized = true;
+ 
+    const dashboard =
+        document.getElementById(
+            "dashboard"
+        );
+ 
+    const close =
+        document.getElementById(
+            "dashboard-close"
+        );
+ 
+    const toggle =
+        document.getElementById(
+            "dashboard-toggle"
+        );
+ 
+    // Helper: toggle geolocate button visibility based on dashboard state
+    // On desktop (dashboard is a side panel), always show the button.
+    // On mobile (dashboard covers the full map), hide when dashboard is open.
+    const syncGeolocateVisibility = () => {
+        try {
+            const gw = document.getElementById('geolocate-wrapper');
+            if (!gw) return;
+            const isMobile = window.innerWidth <= 768;
+            if (!isMobile) {
+                // Desktop: map always visible behind dashboard, always show button
+                gw.style.display = '';
+                return;
+            }
+            // Mobile: hide when dashboard covers the map
+            const isOpen = dashboard && window.getComputedStyle(dashboard).display !== 'none';
+            gw.style.display = isOpen ? 'none' : '';
+        } catch(e) {}
+    };
+ 
+    if (close) {
+ 
+        close.onclick =
+            function() {
+ 
+                dashboard.style.display =
+                    "none";
+ 
+                toggle.style.display =
+                    "block";
+ 
+                syncGeolocateVisibility();
+ 
+            };
+ 
+    }
+ 
+ 
+    if (toggle) {
+ 
+        toggle.onclick =
+            function() {
+ 
+                dashboard.style.display =
+                    "block";
+ 
+                toggle.style.display =
+                    "none";
+ 
+                syncGeolocateVisibility();
+ 
+            };
+ 
+    }
+ 
+}
+ 
+let dataViewCurrentPage = 1;
+let dataViewCurrentType = 'FAT';
+const DATA_VIEW_PAGE_SIZE = 100;
+ 
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+ 
+function matchesDataViewSearch(item, query) {
+    if (!query) return true;
+    const q = query.toLowerCase();
+    return [
+        item.label || item.username,
+        item.id,
+        item.site,
+        item.ket || item.status,
+        item.city,
+        item.district,
+        item.ward,
+        item.visitDate,
+        item.latitude,
+        item.longitude
+    ].some(value => String(value ?? '').toLowerCase().includes(q)) ||
+        Object.values(item.dataFatFull || {}).some(value =>
+            String(value ?? '').toLowerCase().includes(q)
+        );
+}
+ 
+function compareVisitDateDesc(a, b) {
+    const pa = parseVisitDate(a.visitDate);
+    const pb = parseVisitDate(b.visitDate);
+    if (pa && pb) {
+        const da = `${pa.year}-${pa.month}-${pa.day}`;
+        const db = `${pb.year}-${pb.month}-${pb.day}`;
+        if (da < db) return 1;
+        if (da > db) return -1;
+        return 0;
+    }
+    if (pa && !pb) return -1;
+    if (!pa && pb) return 1;
+    return String(b.visitDate || '').localeCompare(String(a.visitDate || ''), 'id', { numeric: true, sensitivity: 'base' });
+}
+
+function getDataViewData() {
+    const searchInput = document.getElementById('data-view-search');
+    const query = String(searchInput?.value || '').trim();
+    const filters = getSidebarFilterState();
+
+    const selectedCustomers = (Array.isArray(customers) ? customers : [])
+        .filter(item => (item.dataType || 'FAT') === dataViewCurrentType);
+    let data = filterCustomersBySidebar(selectedCustomers, filters);
+    if (query) {
+        data = data.filter(item => matchesDataViewSearch(item, query));
+    }
+    data = data.slice().sort(compareVisitDateDesc);
+
+    const headers = [...new Set(data.flatMap(item =>
+        Object.keys(item.dataFatFull || {})
+    ))];
+
+    // Export Excel hanya ditawarkan ketika ada filter yang aktif.
+    const filterActive = !!(filters.city || filters.site || filters.portStatus || filters.keyword || query);
+
+    return { data, headers, query, filters, filterActive };
+}
+
+function renderDataView(page = 1) {
+    const overlay = document.getElementById('data-view-overlay');
+    const tbody = document.getElementById('data-view-tbody');
+    const pageInfo = document.getElementById('data-view-page-info');
+    const countLabel = document.getElementById('data-view-count');
+    const searchInput = document.getElementById('data-view-search');
+    const tableHead = document.querySelector('#data-view-table thead');
+    const title = document.getElementById('data-view-title');
+    const fatButton = document.getElementById('data-view-fat-button');
+    const fdtButton = document.getElementById('data-view-fdt-button');
+    if (!overlay || !tbody || !pageInfo || !countLabel || !searchInput) return;
+    if (title) title.textContent = `Seluruh Data ${dataViewCurrentType}`;
+    if (fatButton) {
+        const selected = dataViewCurrentType === 'FAT';
+        fatButton.setAttribute('aria-pressed', String(selected));
+        fatButton.style.backgroundColor = selected ? '#0d9103' : '#64748b';
+    }
+    if (fdtButton) {
+        const selected = dataViewCurrentType === 'FDT';
+        fdtButton.setAttribute('aria-pressed', String(selected));
+        fdtButton.style.backgroundColor = selected ? '#0d9103' : '#64748b';
+    }
+ 
+    const viewData = getDataViewData();
+    const data = viewData.data;
+ 
+    const total = data.length;
+    const totalPages = Math.max(1, Math.ceil(total / DATA_VIEW_PAGE_SIZE));
+    dataViewCurrentPage = Math.min(Math.max(1, page), totalPages);
+ 
+    const headers = viewData.headers;
+    if (tableHead) {
+        tableHead.innerHTML = `<tr>${headers.map(header =>
+            `<th style="padding:10px; border-bottom:1px solid #ddd; text-align:left; white-space:nowrap;">${escapeHtml(header)}</th>`
+        ).join('')}</tr>`;
+    }
+    tbody.innerHTML = "";
+ 
+    const start = total === 0 ? 0 : (dataViewCurrentPage - 1) * DATA_VIEW_PAGE_SIZE;
+    const end = Math.min(total, start + DATA_VIEW_PAGE_SIZE);
+ 
+    for (let i = start; i < end; i++) {
+        const item = data[i];
+        const raw = item.dataFatFull || {};
+        const row = document.createElement('tr');
+        row.innerHTML = headers.map(header =>
+            `<td style="padding:8px; border-bottom:1px solid #ddd; white-space:nowrap;">${escapeHtml(raw[header] ?? '')}</td>`
+        ).join('');
+        tbody.appendChild(row);
+    }
+ 
+    pageInfo.textContent = total === 0
+        ? 'Tidak ada data yang cocok.'
+        : `Menampilkan ${start + 1}-${end} dari ${total} baris`;
+    countLabel.textContent = `Total data saat ini: ${total}`;
+
+    // Tombol Export Excel hanya muncul saat filter aktif dan ada baris hasil.
+    const exportBtn = document.getElementById('data-view-export');
+    if (exportBtn) exportBtn.style.display = (viewData.filterActive && total > 0) ? '' : 'none';
+ 
+    const prev = document.getElementById('data-view-prev');
+    const next = document.getElementById('data-view-next');
+    if (prev) prev.disabled = dataViewCurrentPage <= 1;
+    if (next) next.disabled = dataViewCurrentPage >= totalPages;
+  
+}
+ 
+function openDataView(dataType = 'FAT') {
+    const overlay = document.getElementById('data-view-overlay');
+    if (!overlay) return;
+    dataViewCurrentType = dataType === 'FDT' ? 'FDT' : 'FAT';
+    overlay.style.display = 'block';
+    // hide geolocate button while data view overlay is visible
+    try { const gw = document.getElementById('geolocate-wrapper'); if (gw) gw.style.display = 'none'; } catch (e) {}
+    // ensure pagination controls are visible when overlay opens
+    try { const prev = document.getElementById('data-view-prev'); if (prev) prev.style.display = ''; } catch(e) {}
+    try { const next = document.getElementById('data-view-next'); if (next) next.style.display = ''; } catch(e) {}
+    dataViewCurrentPage = 1;
+    renderDataView(dataViewCurrentPage);
+}
+ 
+function closeDataView() {
+    const overlay = document.getElementById('data-view-overlay');
+    if (!overlay) return;
+    overlay.style.display = 'none';
+    // restore geolocate button visibility when overlay is closed
+    try {
+        const gw = document.getElementById('geolocate-wrapper');
+        if (gw) {
+            const isMobile = window.innerWidth <= 768;
+            if (!isMobile) {
+                gw.style.display = ''; // Desktop: always show
+            } else {
+                const dash = document.getElementById('dashboard');
+                const dashOpen = dash && window.getComputedStyle(dash).display !== 'none';
+                gw.style.display = dashOpen ? 'none' : '';
+            }
+        }
+    } catch (e) {}
+}
+ 
+/* =========================================================
+   EXPORT EXCEL (.xlsx tanpa library eksternal)
+   ========================================================= */
+
+const XLSX_CRC32_TABLE = (function () {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        table[n] = c >>> 0;
+    }
+    return table;
+})();
+
+function crc32Bytes(bytes) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) c = XLSX_CRC32_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// ZIP writer sederhana: semua entry disimpan (method 0 / stored) agar valid
+// untuk .xlsx tanpa perlu kompresi deflate.
+function buildStoredZip(files) {
+    const encoder = new TextEncoder();
+    const chunks = [];
+    const centralChunks = [];
+    let offset = 0;
+    let centralSize = 0;
+
+    const now = new Date();
+    const dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xFFFF;
+    const dosDate = ((((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate())) & 0xFFFF;
+
+    const pushU16 = (arr, v) => { arr.push(v & 0xFF, (v >>> 8) & 0xFF); };
+    const pushU32 = (arr, v) => { arr.push(v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF); };
+
+    files.forEach(file => {
+        const nameBytes = encoder.encode(file.name);
+        const data = file.data;
+        const crc = crc32Bytes(data);
+
+        const local = [];
+        pushU32(local, 0x04034b50);
+        pushU16(local, 20);      // version needed to extract
+        pushU16(local, 0x0800);  // general purpose flag: UTF-8 names
+        pushU16(local, 0);       // compression: stored
+        pushU16(local, dosTime);
+        pushU16(local, dosDate);
+        pushU32(local, crc);
+        pushU32(local, data.length);
+        pushU32(local, data.length);
+        pushU16(local, nameBytes.length);
+        pushU16(local, 0);       // extra length
+        chunks.push(new Uint8Array(local), nameBytes, data);
+
+        const central = [];
+        pushU32(central, 0x02014b50);
+        pushU16(central, 20);    // version made by
+        pushU16(central, 20);    // version needed to extract
+        pushU16(central, 0x0800);
+        pushU16(central, 0);
+        pushU16(central, dosTime);
+        pushU16(central, dosDate);
+        pushU32(central, crc);
+        pushU32(central, data.length);
+        pushU32(central, data.length);
+        pushU16(central, nameBytes.length);
+        pushU16(central, 0);     // extra length
+        pushU16(central, 0);     // comment length
+        pushU16(central, 0);     // disk number
+        pushU16(central, 0);     // internal attributes
+        pushU32(central, 0);     // external attributes
+        pushU32(central, offset);
+        centralChunks.push(new Uint8Array(central), nameBytes);
+
+        offset += local.length + nameBytes.length + data.length;
+        centralSize += central.length + nameBytes.length;
+    });
+
+    const eocd = [];
+    pushU32(eocd, 0x06054b50);
+    pushU16(eocd, 0);
+    pushU16(eocd, 0);
+    pushU16(eocd, files.length);
+    pushU16(eocd, files.length);
+    pushU32(eocd, centralSize);
+    pushU32(eocd, offset);
+    pushU16(eocd, 0);
+
+    return new Blob([...chunks, ...centralChunks, new Uint8Array(eocd)], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    });
+}
+
+function excelColumnLabel(index) {
+    let n = Math.max(0, Math.floor(Number(index) || 0));
+    let label = '';
+    do {
+        label = String.fromCharCode(65 + (n % 26)) + label;
+        n = Math.floor(n / 26) - 1;
+    } while (n >= 0);
+    return label;
+}
+
+function escapeXmlText(value) {
+    return String(value ?? '')
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function buildXlsxBlob(rows, sheetName) {
+    const encoder = new TextEncoder();
+    const safeSheetName = (String(sheetName || 'Data').replace(/[[\]:*?/\\]/g, ' ').slice(0, 31) || 'Data');
+
+    const sheetRows = (rows || []).map((row, rowIndex) => {
+        const cells = row.map((value, colIndex) => {
+            const ref = excelColumnLabel(colIndex) + (rowIndex + 1);
+            if (typeof value === 'number' && Number.isFinite(value)) {
+                return `<c r="${ref}"><v>${value}</v></c>`;
+            }
+            return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${escapeXmlText(value)}</t></is></c>`;
+        }).join('');
+        return `<row r="${rowIndex + 1}">${cells}</row>`;
+    }).join('');
+
+    const files = [
+        {
+            name: '[Content_Types].xml',
+            data: encoder.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+                '<Default Extension="xml" ContentType="application/xml"/>' +
+                '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+                '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+                '</Types>')
+        },
+        {
+            name: '_rels/.rels',
+            data: encoder.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+                '</Relationships>')
+        },
+        {
+            name: 'xl/workbook.xml',
+            data: encoder.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+                `<sheets><sheet name="${escapeXmlText(safeSheetName)}" sheetId="1" r:id="rId1"/></sheets>` +
+                '</workbook>')
+        },
+        {
+            name: 'xl/_rels/workbook.xml.rels',
+            data: encoder.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+                '</Relationships>')
+        },
+        {
+            name: 'xl/worksheets/sheet1.xml',
+            data: encoder.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+                `<sheetData>${sheetRows}</sheetData>` +
+                '</worksheet>')
+        }
+    ];
+
+    return buildStoredZip(files);
+}
+
+function exportDataViewToExcel() {
+    try {
+        const viewData = getDataViewData();
+        const data = viewData.data;
+        const headers = viewData.headers;
+
+        if (!headers.length || !data.length) {
+            alert('Tidak ada data untuk diexport.');
+            return;
+        }
+
+        const rows = [headers.slice()];
+        data.forEach(item => {
+            const raw = item.dataFatFull || {};
+            rows.push(headers.map(header => raw[header] ?? ''));
+        });
+
+        const blob = buildXlsxBlob(rows, `Seluruh Data ${dataViewCurrentType}`);
+        const now = new Date();
+        const pad = n => String(n).padStart(2, '0');
+        const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+        const filename = `Seluruh-Data-${dataViewCurrentType}_${stamp}.xlsx`;
+
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch (e) {
+        console.error('exportDataViewToExcel gagal', e);
+        alert('Export Excel gagal. Silakan coba lagi.');
+    }
+}
+
+function setupDataView() {
+    const overlay = document.getElementById('data-view-overlay');
+    const closeBtn = document.getElementById('data-view-close');
+    const prev = document.getElementById('data-view-prev');
+    const next = document.getElementById('data-view-next');
+    const fatButton = document.getElementById('data-view-fat-button');
+    const fdtButton = document.getElementById('data-view-fdt-button');
+    if (!overlay || setupDataView._initialized) return;
+    setupDataView._initialized = true;
+ 
+    if (closeBtn) {
+        closeBtn.addEventListener('click', closeDataView);
+    }
+    if (prev) {
+        prev.addEventListener('click', function() {
+            if (dataViewCurrentPage > 1) {
+                renderDataView(dataViewCurrentPage - 1);
+            }
+        });
+    }
+    if (next) {
+        next.addEventListener('click', function() {
+            renderDataView(dataViewCurrentPage + 1);
+        });
+    }
+    if (fatButton) {
+        fatButton.addEventListener('click', function() {
+            dataViewCurrentType = 'FAT';
+            renderDataView(1);
+        });
+    }
+    if (fdtButton) {
+        fdtButton.addEventListener('click', function() {
+            dataViewCurrentType = 'FDT';
+            renderDataView(1);
+        });
+    }
+   const searchInput = document.getElementById('data-view-search');
+   if (searchInput) {
+       searchInput.addEventListener('input', function() {
+           renderDataView(1);
+       });
+   }
+
+   const exportBtn = document.getElementById('data-view-export');
+   if (exportBtn) {
+       exportBtn.addEventListener('click', exportDataViewToExcel);
+   }
+
+   // MutationObserver: hide geolocate-like floating buttons whenever data view overlay is shown
+   try {
+       const hideCandidates = (hide) => {
+           try {
+               // Strategy: hide known controls (by id/class/text) AND any small fixed-position floating element
+               const known = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+               const candidates = new Set(known);
+
+               // Add any element that is fixed-position, small, and located near bottom-right
+               const all = Array.from(document.querySelectorAll('body *'));
+               for (const el of all) {
+                   try {
+                       const cs = window.getComputedStyle(el);
+                       if (!cs) continue;
+                       if (cs.position === 'fixed') {
+                           const w = el.offsetWidth || el.getBoundingClientRect().width || 0;
+                           const h = el.offsetHeight || el.getBoundingClientRect().height || 0;
+                           if (w > 6 && w < 120 && h > 6 && h < 120) {
+                               const rect = el.getBoundingClientRect();
+                               const nearBottom = (rect.bottom >= (window.innerHeight - 120));
+                               const nearRight = (rect.right >= (window.innerWidth - 120));
+                               if (nearBottom && nearRight) candidates.add(el);
+                           }
+                       }
+                   } catch (e) {}
+               }
+
+               for (const el of candidates) {
+                   try {
+                       // Never hide pagination controls inside the data view
+                       const lid = (el.id || '').toString();
+                       if (lid === 'data-view-prev' || lid === 'data-view-next' || lid === 'data-view-close' || lid === 'data-view-export') continue;
+
+                       const txt = (el.textContent || '').trim();
+                       const id = (el.id || '').toString().toLowerCase();
+                       const cls = (el.className || '').toString().toLowerCase();
+                       const looksLikeGeo = txt.includes('🧍🏿') || id.includes('geolocate') || id.includes('geolocate-btn') || id.includes('marker-edit') || id.includes('save-edits') || cls.includes('marker-edit') || cls.includes('geolocate');
+                       if (!looksLikeGeo) {
+                           // also allow hiding by spatial location (small fixed near bottom-right)
+                           const cs = window.getComputedStyle(el);
+                           const rect = el.getBoundingClientRect();
+                           const small = (rect.width > 6 && rect.width < 120 && rect.height > 6 && rect.height < 120);
+                           const nearBR = rect.bottom >= (window.innerHeight - 120) && rect.right >= (window.innerWidth - 120);
+                           if (!(small && nearBR)) continue;
+                       }
+
+                       if (hide) {
+                           if (!el.dataset._prevDisplay) el.dataset._prevDisplay = window.getComputedStyle(el).display || '';
+                           el.style.display = 'none';
+                       } else {
+                           try { el.style.display = el.dataset._prevDisplay || ''; } catch (e) { el.style.display = ''; }
+                           try { delete el.dataset._prevDisplay; } catch (e) {}
+                       }
+                   } catch (e) {}
+               }
+           } catch (e) {}
+       };
+
+       const sync = () => {
+           try {
+               const cs = window.getComputedStyle(overlay);
+               const rects = overlay.getClientRects ? overlay.getClientRects() : [];
+               const visible = (cs.display !== 'none') && (cs.visibility !== 'hidden') && (rects && rects.length > 0) && (parseFloat(cs.opacity || '1') > 0.01);
+               hideCandidates(visible);
+           } catch (e) {}
+       };
+
+       // initial sync
+       sync();
+       const mo = new MutationObserver(function(mutations) {
+           for (const m of mutations) {
+               if (m.type === 'attributes' && m.attributeName === 'style') {
+                   sync();
+               }
+           }
+       });
+       mo.observe(overlay, { attributes: true, attributeFilter: ['style'] });
+
+       // also listen for clicks that may open overlay via other controls
+       document.addEventListener('click', function() { setTimeout(sync, 50); }, true);
+   } catch (e) { console.warn('setupDataView observer failed', e); }
+}
+ 
+/* =========================================================
+   ROBUST CSV LOADER
+   Attempts fetch(), falls back to XMLHttpRequest, and
+   detects file:// usage so the user gets a helpful message.
+   ========================================================= */
+
+function isFileProtocol() {
+    return typeof window !== 'undefined' && window.location &&
+        window.location.protocol === 'file:';
+}
+
+function loadCsvTextWithXhr(url) {
+    return new Promise(function(resolve, reject) {
+        try {
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', url, true);
+            xhr.responseType = 'text';
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState !== 4) return;
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve(xhr.responseText);
+                } else {
+                    reject(new Error('CSV gagal dibaca (XHR). HTTP ' + xhr.status + ' ' + xhr.statusText));
+                }
+            };
+            xhr.onerror = function() {
+                reject(new Error('CSV gagal dibaca (XHR network error).'));
+            };
+            xhr.send();
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+async function loadCsvText(url) {
+    // Clear, actionable guidance when opened directly from disk (file://)
+    if (isFileProtocol()) {
+        const msg =
+            'File CSV tidak dapat dimuat karena halaman dibuka langsung dari file (file://).\n\n' +
+            'Browser memblokir fetch file lokal demi keamanan.\n\n' +
+            'Solusi:\n' +
+            '1. Jalankan lewat server lokal (contoh: http://localhost/qgis/index.html via XAMPP), ATAU\n' +
+            '2. Deploy ke hosting gratis (Azure Static Web Apps) lalu buka lewat https.';
+        console.error('[CUSTOMER_MAP] file:// protocol detected. ' + msg);
+        throw new Error(msg);
+    }
+
+    let lastError = null;
+    try {
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error('CSV gagal dibaca. HTTP ' + response.status);
+        }
+        return await response.text();
+    } catch (fetchError) {
+        lastError = fetchError;
+        console.warn('[CUSTOMER_MAP] fetch failed, trying XHR fallback', fetchError);
+        try {
+            return await loadCsvTextWithXhr(url);
+        } catch (xhrError) {
+            console.warn('[CUSTOMER_MAP] XHR fallback also failed', xhrError);
+            throw lastError;
+        }
+    }
+}
+
+/* =========================================================
+   XLSX / ROWS HELPERS (Data FAT Full)
+   ========================================================= */
+
+async function loadXlsxArrayBuffer(url) {
+    if (isFileProtocol()) {
+        const msg =
+            'File data tidak dapat dimuat karena halaman dibuka langsung dari file (file://).\n\n' +
+            'Browser memblokir fetch file lokal demi keamanan.\n\n' +
+            'Solusi:\n' +
+            '1. Jalankan lewat server lokal (contoh: http://localhost/qgis/index.html via XAMPP), ATAU\n' +
+            '2. Deploy ke hosting (Azure Static Web Apps / GitHub Pages) lalu buka lewat https.';
+        console.error('[CUSTOMER_MAP] file:// protocol detected. ' + msg);
+        throw new Error(msg);
+    }
+    let lastError = null;
+    try {
+        // no-cache: paksa revalidasi ke server supaya file data terbaru langsung terpakai.
+        const response = await fetch(url, { cache: 'no-cache' });
+        if (!response.ok) {
+            throw new Error('Data gagal dibaca. HTTP ' + response.status);
+        }
+        return await response.arrayBuffer();
+    } catch (fetchError) {
+        lastError = fetchError;
+        console.warn('[CUSTOMER_MAP] fetch failed, trying XHR fallback', fetchError);
+        try {
+            return await new Promise(function (resolve, reject) {
+                const xhr = new XMLHttpRequest();
+                xhr.open('GET', url, true);
+                xhr.responseType = 'arraybuffer';
+                xhr.onreadystatechange = function () {
+                    if (xhr.readyState !== 4) return;
+                    if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response);
+                    else reject(new Error('Data gagal dibaca (XHR). HTTP ' + xhr.status + ' ' + xhr.statusText));
+                };
+                xhr.onerror = function () {
+                    reject(new Error('Data gagal dibaca (XHR network error).'));
+                };
+                xhr.send();
+            });
+        } catch (xhrError) {
+            console.warn('[CUSTOMER_MAP] XHR fallback also failed', xhrError);
+            throw lastError;
+        }
+    }
+}
+
+// Baca buffer XLSX -> array row objects (pakai XLSXLite dari resources/xlsx-lite.js)
+async function xlsxDataSetsFromBuffer(buf) {
+    if (typeof XLSXLite !== 'undefined' && XLSXLite && typeof XLSXLite.read === 'function') {
+        const wb = await XLSXLite.read(buf);
+        const sheetNames = wb.sheetNames || [];
+        if (sheetNames.length === 0) throw new Error('XLSX tidak berisi sheet apa pun.');
+        const targetNames = sheetNames.filter(name => ['FAT', 'FDT'].includes(String(name).trim().toUpperCase()));
+        const selectedNames = targetNames.length > 0 ? targetNames : sheetNames.slice(0, 1);
+        const datasets = selectedNames.map(sheetName => {
+            const sheetRows = wb.sheets[sheetName];
+            if (!sheetRows) throw new Error(`Sheet "${sheetName}" tidak dapat dibaca.`);
+            const rows = XLSXLite.sheetToObjects(sheetRows);
+            wb.sheets[sheetName] = null;
+            return { sheetName, rows };
+        });
+        console.log('[CUSTOMER_MAP] XLSX sheets:', sheetNames.join(', '), '-> memakai', datasets.map(data => `"${data.sheetName}" (${data.rows.length} rows)`).join(', '));
+        return datasets;
+    }
+    throw new Error('Parser XLSX (resources/xlsx-lite.js) tidak termuat.');
+}
+
+function deduplicateCustomerMarkers(items) {
+    const markers = new Map();
+    let duplicateCount = 0;
+
+    for (const item of items) {
+        const dataType = item.dataType || 'FAT';
+        const rawData = item.dataFatFull && typeof item.dataFatFull === 'object'
+            ? item.dataFatFull
+            : null;
+        const fatCode = rawData
+            ? Object.entries(rawData).find(([field]) =>
+                normalize(field).replace(/_/g, ' ').toLowerCase() === 'fat code old'
+            )?.[1]
+            : '';
+        const preserveFATRecord = String(dataType).toUpperCase() === 'FAT' && String(fatCode ?? '').trim() !== '';
+        const key = JSON.stringify([
+            dataType,
+            String(item.label || item.id || '').trim().toUpperCase(),
+            String(item.siteId || item.dataFatFull?.['Site ID'] || '').trim().toUpperCase(),
+            Number(item.latitude),
+            Number(item.longitude),
+            preserveFATRecord ? rawData : null
+        ]);
+        const existing = markers.get(key);
+        if (existing) {
+            duplicateCount++;
+            const existingData = existing.dataFatFull && typeof existing.dataFatFull === 'object'
+                ? { ...existing.dataFatFull }
+                : {};
+            const incomingData = item.dataFatFull && typeof item.dataFatFull === 'object'
+                ? item.dataFatFull
+                : {};
+            for (const field of new Set([...Object.keys(existingData), ...Object.keys(incomingData)])) {
+                const values = [existingData[field], incomingData[field]]
+                    .map(value => String(value ?? '').trim())
+                    .filter(Boolean);
+                const uniqueValues = [...new Set(values)];
+                if (uniqueValues.length > 0) existingData[field] = uniqueValues.join(' / ');
+            }
+            existing.dataFatFull = existingData;
+            continue;
+        }
+        markers.set(key, item);
+    }
+
+    if (duplicateCount > 0) {
+        console.warn(`[CUSTOMER_MAP] Combined ${duplicateCount} duplicate marker row(s) into their matching markers.`);
+    }
+    return [...markers.values()];
+}
+
+/* =========================================================
+   LOAD DATA (XLSX)
+   ========================================================= */
+
+async function loadData(input = null) {
+
+    const loadingMessage = document.getElementById('map-loading-message');
+    const loadingStatus = document.getElementById('map-loading');
+    const showLoadingMessage = async message => {
+        if (loadingMessage) loadingMessage.textContent = message;
+        if (loadingStatus) loadingStatus.hidden = false;
+        await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+    };
+
+    try {
+
+        const xlsxBufferPromise = input === null
+            ? (window.customerDataPreload
+                ? window.customerDataPreload.then(buffer => buffer || loadXlsxArrayBuffer(DATA_URL))
+                : loadXlsxArrayBuffer(DATA_URL))
+            : null;
+
+        // Ensure polygon layers are ready so ward index is accurate
+        await showLoadingMessage('Menyiapkan batas wilayah peta...');
+        await waitForLayersReady(5000, 5);
+
+        await showLoadingMessage('Menyiapkan indeks wilayah...');
+        try { buildWardIndex(); } catch(e){ console.warn('buildWardIndex failed (pre-fetch)', e); }
+        try { buildCityBoundaryIndex(); } catch(e){ console.warn('buildCityBoundaryIndex failed (pre-fetch)', e); }
+
+        // Remove any stale customer layers before loading fresh data
+        try { removeStaleCustomerLayers(); } catch(e) { }
+
+        // Sumber data: data/Data FAT Full.xlsx (default), atau upload CSV/XLSX, atau array rows
+        let rows;
+        let datasets = null;
+        if (input === null) {
+            await showLoadingMessage('Membaca file FAT...');
+            const buf = await xlsxBufferPromise;
+            datasets = await xlsxDataSetsFromBuffer(buf);
+            rows = datasets[0]?.rows || [];
+        } else if (Array.isArray(input)) {
+            rows = input;
+        } else if (typeof ArrayBuffer !== 'undefined' && input instanceof ArrayBuffer) {
+            await showLoadingMessage('Membaca file FAT...');
+            datasets = await xlsxDataSetsFromBuffer(input);
+            rows = datasets[0]?.rows || [];
+        } else {
+            await showLoadingMessage('Membaca file FAT...');
+            rows = parseCSV(String(input));
+        }
+        if (!datasets) datasets = [{ sheetName: 'FAT', rows }];
+        rows = null;
+
+        console.log('[CUSTOMER_MAP] loadData start, rows=', datasets.map(data => `${data.sheetName}=${data.rows.length}`).join(', '));
+        // Faster initial render: show a small immediate subset while full CSV is parsed in the background
+        const t0 = performance.now();
+
+        // Parse seluruh rows secara chunked (tanpa preview; dataset XLSX sudah cepat diparse)
+        const isMobile = window.matchMedia('(max-width: 768px)').matches;
+        customers = [];
+        for (const dataset of datasets) {
+            const dataType = String(dataset.sheetName || 'FAT').trim().toUpperCase() === 'FDT' ? 'FDT' : 'FAT';
+            await showLoadingMessage(`Memproses data ${dataType}... 0%`);
+            const parsed = await parseCustomerDataAsync(dataset.rows, {
+                chunkSize: isMobile ? 250 : 1000,
+                onProgress: (processed, total) => {
+                    if (loadingMessage && total > 0) {
+                        const percent = Math.floor((processed / total) * 100);
+                        loadingMessage.textContent = `Memproses data ${dataType}... ${percent}%`;
+                    }
+                }
+            });
+            customers.push(...parsed);
+        }
+        const t1 = performance.now();
+        console.log('[CUSTOMER_MAP] loadData parsed customers count=', customers.length, 'parseMs=', Math.round(t1 - t0));
+        siteValuesCache.clear();
+        await showLoadingMessage('Menyiapkan tampilan peta...');
+
+        if (customers.length === 0) {
+            console.warn('[CUSTOMER_MAP] loadData: tidak ada baris valid diparse, mencoba fallback parse');
+            customers = deduplicateCustomerMarkers(datasets.flatMap(dataset => fallbackParseCustomerRows(dataset.rows)));
+            console.log('[CUSTOMER_MAP] loadData fallback customers count=', customers.length);
+        } else {
+            customers = deduplicateCustomerMarkers(customers);
+        }
+        datasets.forEach(dataset => { dataset.rows = null; });
+
+        const filterStart = performance.now();
+        try { updateFilters(); } catch (e) { console.error('[CUSTOMER_MAP] updateFilters gagal', e); }
+        console.log('[CUSTOMER_MAP] filter setup ms=', Math.round(performance.now() - filterStart));
+
+        setupFilters();
+        setupDashboard();
+        setupDataView();
+        setupProjectDataView();
+        setupMapClick();
+        createCustomerLayer();
+        setupMarkerTranslation();
+        drawCustomers(customers, { expandGroups: true });
+        await loadProjectData();
+        updateSummary(customers);
+        updateChart(customers);
+        updateODCChart(customers);
+        updateProjectSummary(filteredProjectRecords);
+        window.customerMapReady = true;
+        if (loadingStatus) loadingStatus.hidden = true;
+
+    }
+catch (error) {
+
+    console.error(error);
+    const loadingStatus = document.getElementById('map-loading');
+    try {
+        if (!projectLayer) await loadProjectData();
+        setupDashboard();
+        setupProjectDataView();
+        setupMapClick();
+        window.customerMapReady = true;
+        if (loadingStatus) loadingStatus.hidden = true;
+        alert(`Data FAT tidak dapat dimuat: ${error.message}\nPeta Data Project tetap ditampilkan.`);
+        return;
+    } catch (projectError) {
+        console.error('[CUSTOMER_MAP] Project map fallback failed:', projectError);
+        if (loadingStatus) loadingStatus.hidden = true;
+        alert(
+            `Data FAT gagal dimuat: ${error.message}\n` +
+            `Data Project juga gagal dimuat: ${projectError.message}`
+        );
+    }
+
+}
+
+
+}
+
+/* =========================================================
+   SHIM WEB WORKER PARSE (opsional; pakai parser utama)
+   ========================================================= */
+
+function parseCustomerDataWithWorker(text, wardIndexEntries, options = {}) {
+    // Worker khusus CSV lama tidak dipakai lagi; gunakan parser utama agar mapping header konsisten
+    return parseCustomerDataAsync(text, { chunkSize: (options && options.chunkSize) || 1000 });
+}
+
+/* =========================================================
+   START
+   ========================================================= */
+
+async function waitForLayersReady(timeout = 3000, interval = 5) {
+    const layers = [];
+    if (typeof lyr_surabaya_2 !== 'undefined') layers.push(lyr_surabaya_2);
+    if (typeof lyr_SIDOARJO_1 !== 'undefined') layers.push(lyr_SIDOARJO_1);
+    if (typeof lyr_Denpasar_1 !== 'undefined') layers.push(lyr_Denpasar_1);
+    const start = Date.now();
+    return new Promise(resolve => {
+        const check = () => {
+            try {
+                const ready = layers.every(layer => !layer || !(layer.getSource && typeof layer.getSource().getFeatures === 'function') || layer.getSource().getFeatures().length > 0);
+                if (ready || Date.now() - start > timeout) {
+                    resolve();
+                } else {
+                    setTimeout(check, interval);
+                }
+            } catch (e) {
+                resolve();
+            }
+        };
+        check();
+    });
+}
+
+async function startProjectMap() {
+    const loadingStatus = document.getElementById('map-loading');
+    try {
+        setupFilters();
+        setupDashboard();
+        setupProjectDataView();
+        setupMapClick();
+        await loadProjectData();
+        window.customerMapReady = true;
+    } catch (error) {
+        console.error('[PROJECT_MAP] Project map failed to load:', error);
+        alert(`Data Project gagal dimuat: ${error.message}`);
+    } finally {
+        if (loadingStatus) loadingStatus.hidden = true;
+    }
+}
+
+async function startCustomerMap() {
+    if (window.dashboardAuthReady) {
+        await window.dashboardAuthReady;
+    }
+
+    const start = Date.now();
+    while (typeof map === "undefined" || !map) {
+        if (Date.now() - start > 5000) {
+            console.error("OpenLayers map belum tersedia setelah 5000ms.");
+            return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 5));
+    }
+
+    if (!map._customerViewportRenderBound) {
+        map.on('moveend', scheduleViewportCustomerRender);
+        map._customerViewportRenderBound = true;
+    }
+
+    // Remove controls left by an older cached script version.
+    document.querySelectorAll('#marker-edit-toggle, #marker-edit-floating, #popup-edit-controls').forEach(element => element.remove());
+ 
+    // Geolocate control (device GPS)
+    try { setupGeolocateControl(); } catch (e) { console.warn('setupGeolocateControl failed', e); }
+    focusMapOnAsianetSurabaya();
+    await startProjectMap();
+}
+
+/*
+ * Tunggu qgis2web selesai membuat map
+ */
+
+if (
+    document.readyState ===
+    "loading"
+) {
+
+    document.addEventListener(
+        "DOMContentLoaded",
+        function() {
+
+            setTimeout(
+                startCustomerMap,
+                5
+            );
+
+        }
+    );
+
+}
+else {
+
+    setTimeout(
+        startCustomerMap,
+        5
+    );
+
+}

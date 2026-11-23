@@ -1,0 +1,1113 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="X-UA-Compatible" content="IE=edge">
+        <meta name="viewport" content="initial-scale=1,user-scalable=no,maximum-scale=1,width=device-width">
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <link rel="stylesheet" href="./resources/ol.css">
+        <link rel="stylesheet" href="resources/fontawesome-all.min.css">
+        <link href="resources/photon-geocoder-autocomplete.min.css" rel="stylesheet">
+        <link rel="stylesheet" href="./resources/ol-layerswitcher.css">
+        <link rel="stylesheet" href="./resources/qgis2web.css">
+        <style>
+		#dashboard {
+    position: absolute;
+    z-index: 9999;
+    top: 15px;
+    left: 15px;
+    width: 330px;
+    max-height: calc(100vh - 30px);
+    overflow-y: auto;
+    background: rgba(255,255,255,.97);
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,.25);
+    padding: 15px;
+    font-family: Arial, sans-serif;
+}
+
+.dashboard-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 18px;
+    margin-bottom: 15px;
+}
+
+#dashboard-close {
+    border: 0;
+    background: transparent;
+    font-size: 24px;
+    cursor: pointer;
+}
+
+#dashboard-toggle {
+    position: absolute;
+    z-index: 9998;
+    top: 15px;
+    left: 15px;
+    display: none;
+    border: 0;
+    border-radius: 8px;
+    padding: 10px 14px;
+    background: white;
+    box-shadow: 0 2px 10px rgba(0,0,0,.25);
+    cursor: pointer;
+    font-size: 18px;
+}
+
+.filter-group label {
+    display: block;
+    margin-top: 8px;
+    margin-bottom: 4px;
+    font-size: 12px;
+    font-weight: bold;
+}
+
+.filter-row {
+    display: flex !important;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    align-items: flex-start;
+}
+
+.filter-half {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 45%;
+    min-width: 140px;
+}
+
+.filter-group select,
+.filter-half select {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: white;
+    box-sizing: border-box;
+}
+
+.site-dropdown {
+    position: relative;
+}
+
+.site-dropdown-toggle {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: white;
+    box-sizing: border-box;
+    text-align: left;
+    cursor: pointer;
+}
+
+.site-dropdown-panel {
+    position: absolute;
+    z-index: 10001;
+    top: calc(100% + 3px);
+    left: 0;
+    right: 0;
+    padding: 8px;
+    background: white;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.18);
+}
+
+.site-dropdown-panel[hidden] {
+    display: none;
+}
+
+#filter-site-search {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    box-sizing: border-box;
+}
+
+.site-dropdown-options {
+    max-height: 220px;
+    overflow-y: auto;
+    margin-top: 6px;
+}
+
+.site-dropdown-option {
+    display: block;
+    width: 100%;
+    padding: 8px;
+    border: 0;
+    border-radius: 4px;
+    background: white;
+    text-align: left;
+    cursor: pointer;
+}
+
+.site-dropdown-option:hover,
+.site-dropdown-option:focus {
+    background: #eff6ff;
+}
+
+#summary {
+    display: flex;
+    gap: 8px;
+    margin: 15px 0;
+}
+
+.summary-card {
+    flex: 1;
+    padding: 10px;
+    background: #f3f4f6;
+    border-radius: 8px;
+    text-align: center;
+}
+
+.summary-card span {
+    display: block;
+    font-size: 11px;
+    color: #666;
+}
+
+.summary-card strong {
+    display: block;
+    margin-top: 4px;
+    font-size: 20px;
+}
+
+.chart-title {
+    font-weight: bold;
+    margin: 10px 0;
+}
+
+#ward-chart-wrapper {
+    position: relative;
+    width: 100%;
+    height: 250px;
+}
+
+#ward-chart {
+    width: 100%;
+    height: 100% !important;
+}
+
+#odc-chart-panel {
+    margin-top: 18px;
+}
+
+#odc-chart-wrapper {
+    position: relative;
+    width: 100%;
+    height: 180px;
+}
+
+#odc-chart {
+    width: 100%;
+    height: 100% !important;
+}
+
+#legend {
+    margin-top: 10px;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 5px 0;
+    font-size: 12px;
+}
+
+.legend-color {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+}
+
+.customer-popup {
+    min-width: 250px;
+}
+
+.project-popup {
+    min-width: 260px;
+    max-width: min(420px, 70vw);
+}
+
+.project-popup-item {
+    padding: 8px 0;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.project-popup-item:last-of-type {
+    border-bottom: 0;
+}
+
+.project-popup-item strong {
+    display: block;
+    margin-bottom: 5px;
+    color: #172b4d;
+}
+
+.project-action-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 8px;
+}
+
+.project-link-button,
+.project-popup-data-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 32px;
+    padding: 7px 10px;
+    border: 0;
+    border-radius: 6px;
+    background: #1769aa;
+    color: white;
+    font: 600 12px Arial, sans-serif;
+    text-decoration: none;
+    cursor: pointer;
+}
+
+.project-link-button:hover,
+.project-popup-data-button:hover {
+    background: #12558a;
+    color: white;
+}
+
+.project-popup-data-button {
+    width: 100%;
+    margin-top: 10px;
+    background: #0d9103;
+}
+
+.project-data-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10002;
+    overflow: auto;
+    padding: 20px;
+    background: rgba(255,255,255,.98);
+    font-family: Arial, sans-serif;
+}
+
+.project-data-overlay[hidden] {
+    display: none !important;
+}
+
+.project-data-table-wrapper {
+    overflow: auto;
+    max-height: calc(100vh - 100px);
+    border: 1px solid #ddd;
+    border-radius: 10px;
+    background: #fff;
+}
+
+.project-data-table {
+    width: 100%;
+    min-width: 920px;
+    border-collapse: collapse;
+}
+
+.project-data-table th,
+.project-data-table td {
+    padding: 9px;
+    border-bottom: 1px solid #e5e7eb;
+    text-align: left;
+    vertical-align: middle;
+}
+
+.project-data-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: #f7f7f7;
+}
+
+.customer-popup table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.customer-popup td {
+    padding: 4px;
+    border-bottom: 1px solid #eee;
+}
+
+.customer-popup td:first-child {
+    font-weight: bold;
+    width: 42%;
+}
+
+.fat-details-table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+    margin-top: 8px;
+}
+
+.customer-popup .fat-details-table {
+    min-width: 480px;
+    border-collapse: collapse;
+    font-size: 11px;
+}
+
+.customer-popup .fat-details-table th,
+.customer-popup .fat-details-table td {
+    padding: 5px;
+    border: 1px solid #e5e7eb;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.customer-popup .fat-details-table th {
+    background: #f3f4f6;
+}
+
+.gps-button {
+    display: block;
+    margin-top: 10px;
+    padding: 9px;
+    text-align: center;
+    background: #2563eb;
+    color: white;
+    text-decoration: none;
+    border-radius: 6px;
+    font-weight: bold;
+}
+
+body:not(.auth-ready) #dashboard,
+body:not(.auth-ready) #map,
+body:not(.auth-ready) #dashboard-toggle,
+body:not(.auth-ready) #data-view-overlay,
+body:not(.auth-ready) #project-data-overlay {
+    display: none !important;
+}
+
+#map-loading {
+    position: fixed;
+    inset: 0;
+    z-index: 19999;
+    display: grid;
+    place-content: center;
+    gap: 12px;
+    background: rgba(238, 243, 248, .92);
+    color: #172b4d;
+    font: 600 15px Arial, sans-serif;
+    text-align: center;
+}
+
+#map-loading[hidden] {
+    display: none !important;
+}
+
+.map-loading-icon {
+    width: 52px;
+    height: 52px;
+    margin: 0 auto;
+    animation: map-loading-flip 1.2s ease-in-out infinite;
+    object-fit: contain;
+    backface-visibility: visible;
+}
+
+@keyframes map-loading-flip {
+    0% { transform: perspective(240px) rotateY(0deg); }
+    50% { transform: perspective(240px) rotateY(180deg); }
+    100% { transform: perspective(240px) rotateY(360deg); }
+}
+
+#auth-gate {
+    position: fixed;
+    inset: 0;
+    z-index: 20000;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+    background: #eef3f8;
+    font-family: Arial, sans-serif;
+}
+
+#auth-gate[hidden],
+#user-management-modal[hidden],
+#change-password-modal[hidden] {
+    display: none !important;
+}
+
+.auth-card {
+    width: min(100%, 400px);
+    padding: 32px;
+    border-radius: 16px;
+    background: #fff;
+    box-shadow: 0 14px 40px rgba(15, 23, 42, .10);
+}
+
+.auth-card h1 {
+    margin: 0;
+    color: #172b4d;
+    font-size: 25px;
+    text-align: center;
+}
+
+.auth-subtitle {
+    margin: 18px 0 22px;
+    color: #64748b;
+    text-align: center;
+}
+
+.auth-form label,
+.admin-user-form label {
+    display: block;
+    margin: 14px 0 6px;
+    color: #24364b;
+    font-weight: 600;
+}
+
+.auth-form input,
+.admin-user-form input,
+.admin-user-form select {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 44px;
+    padding: 10px 12px;
+    border: 1px solid #d3dce7;
+    border-radius: 8px;
+    background: #fff;
+    font: inherit;
+}
+
+.auth-primary {
+    width: 100%;
+    min-height: 44px;
+    margin-top: 22px;
+    border: 0;
+    border-radius: 8px;
+    background: #1769aa;
+    color: #fff;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.auth-primary:disabled {
+    cursor: wait;
+    opacity: .65;
+}
+
+.auth-message {
+    min-height: 18px;
+    margin: 12px 0 0;
+    color: #b42318;
+    font-size: 13px;
+}
+
+.auth-notice {
+    margin: 15px 0 0;
+    color: #64748b;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.auth-session-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin: 12px 0;
+    color: #334155;
+    font-size: 12px;
+}
+
+.auth-profile-menu {
+    position: relative;
+    margin-left: auto;
+}
+
+.auth-profile-button {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 46px;
+    padding: 6px 12px 6px 7px;
+    border: 1px solid #dbe4ef;
+    border-radius: 14px;
+    background: linear-gradient(135deg, #fff, #f7faff);
+    color: #1e293b;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+    box-shadow: 0 3px 12px rgba(15, 23, 42, .08);
+    transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
+}
+
+.auth-profile-button:hover,
+.auth-profile-button[aria-expanded="true"] {
+    border-color: #93b4dc;
+    box-shadow: 0 6px 18px rgba(15, 23, 42, .13);
+    transform: translateY(-1px);
+}
+
+.auth-profile-button:focus-visible,
+.auth-profile-action:focus-visible {
+    outline: 3px solid rgba(37, 99, 235, .28);
+    outline-offset: 2px;
+}
+
+.auth-profile-avatar {
+    display: grid;
+    width: 32px;
+    height: 32px;
+    flex: 0 0 32px;
+    place-items: center;
+    border-radius: 11px;
+    background: linear-gradient(135deg, #2563eb, #0f766e);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: .04em;
+}
+
+.auth-profile-identity {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+}
+
+.auth-profile-identity strong {
+    max-width: 170px;
+    overflow: hidden;
+    color: #172554;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.auth-profile-identity small {
+    color: #64748b;
+    font-size: 10px;
+}
+
+.auth-profile-chevron {
+    width: 15px;
+    height: 15px;
+    margin-left: 4px;
+    color: #64748b;
+    transition: transform .2s ease;
+}
+
+.auth-profile-button[aria-expanded="true"] .auth-profile-chevron {
+    transform: rotate(180deg);
+}
+
+.auth-profile-dropdown {
+    position: absolute;
+    top: calc(100% + 9px);
+    right: 0;
+    z-index: 20003;
+    width: 208px;
+    padding: 6px;
+    border: 1px solid #e2e8f0;
+    border-radius: 14px;
+    background: #fff;
+    box-shadow: 0 16px 36px rgba(15, 23, 42, .18);
+}
+
+.auth-profile-dropdown[hidden] {
+    display: none;
+}
+
+.auth-profile-action {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-height: 40px;
+    padding: 9px 10px;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    color: #334155;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    text-align: left;
+    transition: background .15s ease, color .15s ease;
+}
+
+.auth-profile-action[hidden] {
+    display: none;
+}
+
+.auth-profile-action:hover {
+    background: #f1f5f9;
+    color: #1d4ed8;
+}
+
+.auth-profile-action svg {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 16px;
+    color: #64748b;
+}
+
+.auth-profile-divider {
+    height: 1px;
+    margin: 5px 4px;
+    background: #e2e8f0;
+}
+
+.auth-profile-action.auth-profile-logout {
+    color: #b42318;
+}
+
+.auth-profile-action.auth-profile-logout:hover {
+    background: #fef2f2;
+    color: #991b1b;
+}
+
+.auth-profile-action.auth-profile-logout svg {
+    color: #b42318;
+}
+
+@media (max-width: 480px) {
+    .auth-profile-dropdown {
+        right: 0;
+        width: min(208px, calc(100vw - 48px));
+    }
+}
+
+#user-management-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 20001;
+    display: grid;
+    place-items: center;
+    overflow-y: auto;
+    padding: 20px;
+    background: rgba(15, 23, 42, .55);
+    font-family: Arial, sans-serif;
+}
+
+#change-password-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 20002;
+    display: grid;
+    place-items: center;
+    overflow-y: auto;
+    padding: 20px;
+    background: rgba(15, 23, 42, .55);
+    font-family: Arial, sans-serif;
+}
+
+.user-management-card {
+    width: min(100%, 480px);
+    max-height: calc(100vh - 40px);
+    overflow-y: auto;
+    padding: 24px;
+    border-radius: 14px;
+    background: #fff;
+}
+
+.user-management-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.user-management-header h2 {
+    margin: 0;
+    color: #172b4d;
+}
+
+#change-password-modal .user-management-header {
+    align-items: center;
+}
+
+#change-password-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    min-height: 36px;
+    padding: 7px 12px;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    background: #f8fafc;
+    color: #475569;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color .18s ease, border-color .18s ease, color .18s ease, transform .18s ease;
+}
+
+#change-password-close:hover {
+    border-color: #cbd5e1;
+    background: #eef2f7;
+    color: #1e293b;
+}
+
+#change-password-close:active {
+    transform: scale(.97);
+}
+
+#change-password-close:focus-visible {
+    outline: 3px solid rgba(37, 99, 235, .28);
+    outline-offset: 2px;
+}
+
+#change-password-close svg {
+    width: 16px;
+    height: 16px;
+}
+
+.user-management-card h3 {
+    margin: 22px 0 8px;
+}
+
+.auth-account-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.auth-account-list li {
+    display: flex;
+    justify-content: space-between;
+    padding: 9px 0;
+    border-bottom: 1px solid #e5e7eb;
+    font-size: 13px;
+}
+
+@media (max-width: 600px) {
+    #dashboard {
+        width: calc(100% - 30px);
+    }
+
+    .auth-card {
+        padding: 26px 22px;
+    }
+}
+        html, body {
+            background-color: #ffffff;
+        }
+        .ol-control > * {
+            background-color: #f8f8f8!important;
+            color: #444444!important;
+            border-radius: 0px;
+        }
+        .ol-attribution a, .gcd-gl-input::placeholder, .search-layer-input-search::placeholder {
+            color: #444444!important;
+        }
+        .search-layer-input-search {
+            background-color: #f8f8f8!important;
+        }
+        .ol-control > *:focus, .ol-control >*:hover {
+            background-color: rgba(248, 248, 248, 0.7)!important;
+        } 
+        .ol-control {
+            background-color: rgba(255,255,255,.4) !important;
+            padding: 2px !important;
+        } 
+        </style>
+
+        <style>
+        html, body, #map {
+            width: 100%;
+            height: 100%;
+            padding: 0;
+            margin: 0;
+        }
+        </style>
+        <title></title>
+    </head>
+    <body>
+<section id="auth-gate" aria-labelledby="auth-title">
+    <div class="auth-card">
+        <h1 id="auth-title">ACTIVE NETWORK DEPLOYMENT</h1>
+        <p id="auth-subtitle" class="auth-subtitle">Data project login terlebih dahulu</p>
+        <div id="auth-setup-view" hidden>
+            <form id="auth-setup-form" class="auth-form">
+                <label for="auth-setup-username">Username admin pertama (dibuat satu kali untuk semua perangkat)</label>
+                <input id="auth-setup-username" name="username" minlength="3" maxlength="32" autocomplete="username" required>
+                <label for="auth-setup-password">Password (minimal 8 karakter)</label>
+                <input id="auth-setup-password" name="password" type="password" minlength="8" autocomplete="new-password" required>
+                <label for="auth-setup-key">Kunci setup satu kali dari pemilik aplikasi</label>
+                <input id="auth-setup-key" name="setupKey" type="password" autocomplete="off" required>
+                <button class="auth-primary" type="submit">Buat Admin</button>
+                <p id="auth-setup-message" class="auth-message" role="alert"></p>
+            </form>
+        </div>
+        <div id="auth-login-view" hidden>
+            <form id="auth-login-form" class="auth-form">
+                <label for="auth-login-username">Username</label>
+                <input id="auth-login-username" name="username" autocomplete="username" required>
+                <label for="auth-login-password">Password</label>
+                <input id="auth-login-password" name="password" type="password" autocomplete="current-password" required>
+                <button id="auth-login-button" class="auth-primary" type="submit">Masuk</button>
+                <p id="auth-login-message" class="auth-message" role="alert"></p>
+            </form>
+        </div>
+        <div class="auth-notice"><center><strong>&copy; 2026 <span style="color:green">Active Network Deployment</span></strong></center></div>
+    </div>
+</section>
+<div id="map-loading" role="status" aria-live="polite" hidden>
+    <img class="map-loading-icon" src="resources/iconamt.png" alt="" aria-hidden="true">
+    <span id="map-loading-message">Menyiapkan peta dan data FAT...</span>
+</div>
+<section id="user-management-modal" hidden aria-labelledby="user-management-title">
+    <div class="user-management-card">
+        <div class="user-management-header">
+            <div>
+                <h2 id="user-management-title">Kelola Akun</h2>
+                <p class="auth-subtitle" style="text-align:left; margin:8px 0 14px;">Tambah akun admin atau user yang dapat digunakan di semua perangkat.</p>
+            </div>
+            <button type="button" id="user-management-close" class="btn btn-danger">X Tutup</button>
+        </div>
+        <form id="admin-user-form" class="admin-user-form">
+            <label for="admin-new-username">Username</label>
+            <input id="admin-new-username" name="username" minlength="3" maxlength="32" autocomplete="off" required>
+            <label for="admin-new-password">Password (minimal 8 karakter)</label>
+            <input id="admin-new-password" name="password" type="password" minlength="8" autocomplete="new-password" required>
+            <label for="admin-new-role">Peran</label>
+            <select id="admin-new-role" name="role">
+                <option value="user">User</option>
+                <option value="admin">Admin</option>
+            </select>
+            <button id="admin-user-submit" class="auth-primary" type="submit">Tambah Akun</button>
+            <p id="admin-user-message" class="auth-message" role="status"></p>
+        </form>
+        <h3>Akun di browser ini</h3>
+        <ul id="auth-account-list" class="auth-account-list"></ul>
+    </div>
+</section>
+<div id="dashboard">
+    <div class="dashboard-header">
+        <img src="resources/logoamt.png" alt="Logo AMT" style="width: 90px; height: auto;">
+        <button id="dashboard-close">×</button>
+    </div>
+    <div class="auth-session-bar">
+        <div class="auth-profile-menu" id="auth-profile-menu">
+            <button type="button" id="auth-profile-toggle" class="auth-profile-button" aria-haspopup="true" aria-expanded="false" aria-controls="auth-profile-dropdown">
+                <span class="auth-profile-avatar" aria-hidden="true">AMT</span>
+                <span class="auth-profile-identity">
+                    <strong id="auth-session-label"></strong>
+                    <small>Profil akun</small>
+                </span>
+                <svg class="auth-profile-chevron" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <path d="m5 7.5 5 5 5-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </button>
+            <div id="auth-profile-dropdown" class="auth-profile-dropdown" hidden>
+                <button type="button" id="auth-manage-users" class="auth-profile-action" hidden>
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m8-10a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm8-3h6m-3-3v6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Kelola Akun
+                </button>
+                <button type="button" id="auth-change-password" class="auth-profile-action">
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10V7a4 4 0 1 1 8 0v3m-4 5v2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                    Ubah Password
+                </button>
+                <div class="auth-profile-divider" aria-hidden="true"></div>
+                <button type="button" id="auth-logout" class="auth-profile-action auth-profile-logout">
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 17l5-5-5-5m5 5H3m9-9h6a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3h-6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Keluar
+                </button>
+            </div>
+        </div>
+    </div>
+    <section id="change-password-modal" hidden aria-labelledby="change-password-title">
+        <div class="user-management-card">
+            <div class="user-management-header">
+                <h2 id="change-password-title">Ubah Password</h2>
+                <button type="button" id="change-password-close" aria-label="Tutup dialog Ubah Password">
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m18 6-12 12M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                    <span>X Tutup</span>
+                </button>
+            </div>
+            <form id="change-password-form" class="auth-form">
+                <label for="auth-current-password">Password saat ini</label>
+                <input id="auth-current-password" name="currentPassword" type="password" autocomplete="current-password" required>
+                <label for="auth-new-password">Password baru (minimal 8 karakter)</label>
+                <input id="auth-new-password" name="newPassword" type="password" minlength="8" autocomplete="new-password" required>
+                <label for="auth-confirm-password">Ulangi password baru</label>
+                <input id="auth-confirm-password" name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required>
+                <button id="change-password-submit" class="auth-primary" type="submit">Simpan Password</button>
+                <p id="change-password-message" class="auth-message" role="status"></p>
+            </form>
+        </div>
+    </section>
+	<br>
+    <div class="filter-group">
+        <form id="coordinate-search-form">
+            <label for="coordinate-search-input">Cari lokasi dengan koordinat</label>
+            <!--<small style="display:block; color:#666;">Contoh: -7.2575, 112.7521</small>-->
+            <div style="display:flex; gap:6px; margin-bottom:4px;">
+                <input
+                type="text"
+                id="coordinate-search-input"
+                placeholder="Latitude, longitude"
+                aria-describedby="coordinate-search-message"
+                style="flex:1; min-width:0; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box;">
+            <button type="submit" style="padding:8px 12px; border:0; border-radius:6px; background:#0d9103; color:white; cursor:pointer;">Cari</button>
+        </div>
+        <!--<small style="display:block; color:#666; ">Klik tombol ukur, lalu klik beberapa titik pada peta untuk membuat belokan.</small>-->
+        <button id="coordinate-ruler-button" type="button" aria-pressed="false" disabled hidden style="width:100%; padding:8px; border:1px solid #94a3b8; border-radius:6px; background:#1e76cf; color:#ffffff; cursor:pointer;"><b>Ukur jarak dari pin</b></button>
+        <b><p id="coordinate-search-message" role="status" aria-live="polite" style="margin:4px 0 8px; font-size:12px;"></p></b>
+    </form>
+    <label for="project-filter-name">Cari Nama Project</label>
+        <input
+            type="text"
+            id="project-filter-name"
+            placeholder="Cari Nama Project..."
+            style="
+                width:100%;
+                padding:8px;
+                border:1px solid #ccc;
+                border-radius:6px;
+                margin-bottom:10px;
+                box-sizing:border-box;
+            ">
+
+        <label for="project-filter-city">City</label>
+        <select id="project-filter-city">
+            <option value="">Semua City</option>
+        </select>
+
+        <label for="project-filter-location">Lokasi Project</label>
+        <select id="project-filter-location">
+            <option value="">Semua Lokasi Project</option>
+        </select>
+
+        <label for="project-filter-implementation-date">Tanggal implementasi</label>
+        <select id="project-filter-implementation-date">
+            <option value="">Semua Tanggal implementasi</option>
+        </select>
+
+        <button id="view-project-data-button" type="button" style="margin-top:8px; width:100%; padding:10px; border-radius:8px; border:1px solid #ffffff; background:#1769aa; color:white; cursor:pointer; font-weight:bold;">Lihat Data Project</button>
+
+    </div>
+    <div id="summary">
+
+        <div class="summary-card">
+            <span>Total Project</span>
+            <strong id="total-customer">0</strong>
+        </div>
+        
+        <div class="summary-card">
+            <span>Total City</span>
+            <strong id="total-ward">0</strong>
+        </div>
+        
+    </div>
+    
+    <div class="chart-title">
+        <center>Jumlah Project berdasarkan <br>Lokasi Project</center>
+    </div>
+
+    <div id="legend"></div>
+    <div id="ward-chart-wrapper">
+        <canvas id="ward-chart"></canvas>
+    </div>
+
+    <div id="odc-chart-panel">
+        <div class="chart-title">
+            <center>Jumlah Pekerjaan berdasarkan <br>Tanggal implementasi</center>
+        </div>
+        <div id="odc-legend"></div>
+        <div id="odc-chart-wrapper">
+            <canvas id="odc-chart"></canvas>
+        </div>
+    </div>
+<br>
+		<div>&copy; 2026 <b>AND | <font color="blue">Active Network Deployment</font></b></div><br>
+</div>
+<div id="data-view-overlay" style="display:none; position:fixed; inset:0; background:rgba(255,255,255,0.98); z-index:10000; overflow:auto; padding:20px;">
+    <div class="data-view-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px;">
+		<div>
+		    <h2 id="data-view-title" style="margin:0; font-size:18px;">Seluruh Data FAT</h2>
+		    <div id="data-view-count" style="font-size:13px; color:#555; margin-top:4px;"></div>
+		</div>
+		<div style="display:flex; gap:8px; align-items:center;">
+			<button id="data-view-export" type="button" style="display:none; border:0; background:#0d9103; color:white; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:bold;">⬇ Export Excel</button>
+			<button id="data-view-close" class="btn btn-danger">X Tutup</button>
+		</div>
+    </div>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px;">
+        <button id="data-view-fat-button" type="button" aria-pressed="true" style="flex:1 1 220px; padding:10px; border:0; border-radius:8px; background:#0d9103; color:white; cursor:pointer; font-weight:bold;">Lihat Seluruh Data FAT</button>
+        <button id="data-view-fdt-button" type="button" aria-pressed="false" style="flex:1 1 220px; padding:10px; border:0; border-radius:8px; background:#64748b; color:white; cursor:pointer; font-weight:bold;">Lihat Seluruh Data FDT</button>
+    </div>
+    <div style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <label for="data-view-search" style="font-size:13px; margin:0; min-width:110px;">Cari data:</label>
+        <input id="data-view-search" type="text" placeholder="Cari label, kota, site, keterangan..." style="flex:1; min-width:220px; padding:8px; border:1px solid #ccc; border-radius:8px;" />
+    </div>
+    <div id="data-view-table-wrapper" style="overflow:auto; max-height:calc(100vh - 150px); border:1px solid #ddd; border-radius:10px; background:#fff;">
+		<table id="data-view-table" style="width:100%; border-collapse:collapse; min-width:700px;">
+		    <thead style="background:#f7f7f7; position:sticky; top:0; z-index:1;">
+        <tr>
+            <th style="padding:10px; border-bottom:1px solid #ddd; text-align:left;">Label</th>
+            <th style="padding:10px; border-bottom:1px solid #ddd; text-align:left;">Kota/Kabupaten</th>
+            <th style="padding:10px; border-bottom:1px solid #ddd; text-align:left;">Nama Site</th>
+            <th style="padding:10px; border-bottom:1px solid #ddd; text-align:left;">Keterangan</th>
+            <th style="padding:10px; border-bottom:1px solid #ddd; text-align:left;">Latitude</th>
+            <th style="padding:10px; border-bottom:1px solid #ddd; text-align:left;">Longitude</th>
+        </tr>
+		    </thead>
+		    <tbody id="data-view-tbody"></tbody>
+		</table>
+    </div>
+    <div id="data-view-pagination" style="display:flex; justify-content:space-between; align-items:center; margin-top:12px; gap:8px; flex-wrap:wrap;">
+		<div id="data-view-page-info" style="font-size:13px; color:#555;"></div>
+		<div style="display:flex; gap:8px;">
+		    <button id="data-view-prev" style="padding:8px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer;">Sebelumnya</button>
+		    <button id="data-view-next" style="padding:8px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer;">Berikutnya</button>
+		</div>
+    </div>
+</div>
+
+<section id="project-data-overlay" class="project-data-overlay" hidden aria-labelledby="project-data-title">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px;">
+        <div>
+            <h2 id="project-data-title" style="margin:0; font-size:20px;">Data Project</h2>
+            <div id="project-data-count" style="margin-top:4px; color:#555; font-size:13px;"></div>
+        </div>
+        <button id="project-data-close" type="button" class="btn btn-danger">X Tutup</button>
+    </div>
+    <div class="project-data-table-wrapper">
+        <table class="project-data-table">
+            <thead>
+                <tr>
+                    <th>Kota</th>
+                    <th>Nama Project</th>
+                    <th>Nama PIC</th>
+                    <th>Lokasi Project</th>
+                    <th>Tanggal implementasi</th>
+                    <th>Status Pekerjaan</th>
+                    <th>Data rack</th>
+                    <th>Link dokumentasi</th>
+                </tr>
+            </thead>
+            <tbody id="project-data-tbody"></tbody>
+        </table>
+    </div>
+</section>
+
+<button id="dashboard-toggle">📊</button>
+        <div id="map">
+            <div id="popup" class="ol-popup">
+                <a href="#" id="popup-closer" class="ol-popup-closer"></a>
+                <div id="popup-content"></div>
+            </div>
+        </div>
+        <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+        <script defer src="./resources/supabase-config.js?v=20261123.4"></script>
+        <script defer src="./resources/browser-auth.js?v=20261123.14"></script>
+        
+    </body>
+</html>
+

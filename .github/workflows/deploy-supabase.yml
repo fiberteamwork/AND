@@ -65,13 +65,15 @@ jobs:
         run: |
           supabase db push --linked --yes
 
+
       # 7. Deploy account Edge Function
       - name: Deploy account Edge Function
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: |
           supabase functions deploy account-api \
-            --project-ref yfbwxqicqdnjpmmhdyeh
+            --remote=yfbwxqicqdnjpmmhdyeh \
+            --yes
 
       # 8. Deployment completed
       - name: Deployment completed

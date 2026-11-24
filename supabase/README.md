@@ -16,16 +16,18 @@ Sebelum workflow dijalankan, tambahkan Repository secrets di GitHub:
 1. Buka **Settings → Secrets and variables → Actions → New repository secret**.
 2. Tambahkan `SUPABASE_ACCESS_TOKEN` dengan Personal Access Token dari Supabase.
 3. Tambahkan `SUPABASE_DB_PASSWORD` dengan password database proyek Supabase.
-4. Untuk setup admin pertama, tambahkan juga `INITIAL_ADMIN_SETUP_KEY` dengan
-   nilai acak panjang. Jangan gunakan nilai yang pernah dikirim di chat.
 
 Jangan membuat atau menyimpan `service_role` key di GitHub, workflow, atau file
 situs. Supabase menyediakan key itu hanya sebagai environment secret Edge
 Function.
 
-Setelah file workflow masuk ke branch `main`, buka **Actions → Deploy Supabase
-account backend → Run workflow**. Pastikan langkah **Apply database migrations**
-dan **Deploy account Edge Function** berhasil.
+Untuk setup admin pertama, atur `INITIAL_ADMIN_SETUP_KEY` langsung di
+**Supabase Dashboard → Edge Functions → Secrets** dengan nilai acak panjang.
+Jangan gunakan nilai yang pernah dikirim di chat.
+
+Setelah workflow masuk ke branch `main`, buka **Actions → Deploy Supabase
+account backend → Run workflow**. Pastikan langkah **Apply database
+migrations** dan **Deploy account Edge Function** berhasil.
 
 ### Jika muncul “Failed to send a request to the Edge Function”
 

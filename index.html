@@ -435,6 +435,97 @@
     display: none !important;
 }
 
+#project-running-slideshow {
+    margin: 0 0 14px;
+    padding: 12px;
+    border: 1px solid #bfdbfe;
+    border-radius: 12px;
+    background: linear-gradient(135deg, #eff6ff, #f0fdfa);
+    box-shadow: 0 4px 12px rgba(37, 99, 235, .09);
+    color: #172554;
+}
+
+#project-running-slideshow[hidden] {
+    display: none !important;
+}
+
+.project-running-slideshow-header,
+.project-running-slideshow-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.project-running-slideshow-heading {
+    display: grid;
+    gap: 2px;
+}
+
+.project-running-slideshow-heading small {
+    color: #0f766e;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+}
+
+.project-running-slideshow-heading strong {
+    font-size: 14px;
+}
+
+#project-running-slide-count {
+    color: #64748b;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.project-running-slideshow-slide {
+    min-height: 48px;
+    padding: 10px 0 8px;
+}
+
+#project-running-slide-name {
+    display: block;
+    color: #1d4ed8;
+    font-size: 14px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+.project-running-slideshow-slide p {
+    margin: 4px 0 0;
+    color: #475569;
+    font-size: 12px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+.project-running-slideshow-controls {
+    justify-content: flex-end;
+}
+
+.project-running-slideshow-controls button {
+    min-width: 34px;
+    min-height: 30px;
+    padding: 5px 9px;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
+    background: #fff;
+    color: #1e3a8a;
+    cursor: pointer;
+    font: 600 12px Arial, sans-serif;
+}
+
+.project-running-slideshow-controls button:hover {
+    background: #dbeafe;
+}
+
+.project-running-slideshow-controls button:focus-visible {
+    outline: 3px solid rgba(37, 99, 235, .28);
+    outline-offset: 2px;
+}
+
 .project-data-table-wrapper {
     overflow: auto;
     max-height: calc(100vh - 100px);
@@ -1180,6 +1271,24 @@ body:not(.auth-ready) #project-running-toast {
             <button id="coordinate-ruler-button" type="button" aria-pressed="false" disabled hidden style="width:100%; padding:8px; border:1px solid #94a3b8; border-radius:6px; background:#1e76cf; color:#ffffff; cursor:pointer;"><b>Ukur jarak dari pin</b></button>
             <b><p id="coordinate-search-message" role="status" aria-live="polite" style="margin:4px 0 8px; font-size:12px;"></p></b>
     </form>
+    <aside id="project-running-slideshow" aria-label="Notifikasi project berjalan" hidden>
+        <div class="project-running-slideshow-header">
+            <div class="project-running-slideshow-heading">
+                <small>Notifikasi</small>
+                <strong>Project Berjalan</strong>
+            </div>
+            <span id="project-running-slide-count"></span>
+        </div>
+        <div class="project-running-slideshow-slide" aria-live="off" aria-atomic="true">
+            <strong id="project-running-slide-name"></strong>
+            <p><span id="project-running-slide-city"></span> · <span id="project-running-slide-location"></span></p>
+        </div>
+        <div class="project-running-slideshow-controls">
+            <button id="project-running-slide-previous" type="button" aria-label="Project sebelumnya" hidden>‹</button>
+            <button id="project-running-slide-pause" type="button" aria-pressed="false" hidden>Jeda</button>
+            <button id="project-running-slide-next" type="button" aria-label="Project berikutnya" hidden>›</button>
+        </div>
+    </aside>
     <label for="project-filter-name">Cari Nama Project</label>
         <input
             type="text"
@@ -1372,7 +1481,7 @@ body:not(.auth-ready) #project-running-toast {
             </div>
         </div>
         <script defer src="./resources/supabase-config.js?v=20261123.5"></script>
-        <script defer src="./resources/browser-auth.js?v=20261126.5"></script>
+        <script defer src="./resources/browser-auth.js?v=20261126.7"></script>
         
     </body>
 </html>

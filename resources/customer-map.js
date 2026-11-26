@@ -24,6 +24,9 @@ let projectLayer = null;
 let projectRunningRecords = [];
 let projectRunningEditingId = null;
 let projectRunningToastTimer = null;
+let projectRunningSlideshowIndex = 0;
+let projectRunningSlideshowTimer = null;
+let projectRunningSlideshowPaused = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
 const siteValuesCache = new Map();
 const MAX_SITE_DROPDOWN_OPTIONS = 100;
 let customerLayer = null;
@@ -3119,6 +3122,55 @@ function showProjectRunningToast(message, type = 'success') {
     }, type === 'error' ? 7000 : 4000);
 }
 
+function renderProjectRunningSlideshow() {
+    const slideshow = document.getElementById('project-running-slideshow');
+    const name = document.getElementById('project-running-slide-name');
+    const city = document.getElementById('project-running-slide-city');
+    const location = document.getElementById('project-running-slide-location');
+    const count = document.getElementById('project-running-slide-count');
+    const previous = document.getElementById('project-running-slide-previous');
+    const pause = document.getElementById('project-running-slide-pause');
+    const next = document.getElementById('project-running-slide-next');
+    if (!slideshow || !name || !city || !location || !count || !previous || !pause || !next) return;
+
+    const total = projectRunningRecords.length;
+    if (!total) {
+        slideshow.hidden = true;
+        window.clearInterval(projectRunningSlideshowTimer);
+        projectRunningSlideshowTimer = null;
+        return;
+    }
+
+    projectRunningSlideshowIndex %= total;
+    const project = projectRunningRecords[projectRunningSlideshowIndex];
+    name.textContent = project.name || 'Project tanpa nama';
+    city.textContent = project.city || '-';
+    location.textContent = project.location || '-';
+    count.textContent = `${projectRunningSlideshowIndex + 1} / ${total}`;
+    slideshow.hidden = false;
+
+    const hasMultipleProjects = total > 1;
+    previous.hidden = !hasMultipleProjects;
+    pause.hidden = !hasMultipleProjects;
+    next.hidden = !hasMultipleProjects;
+    pause.textContent = projectRunningSlideshowPaused ? 'Putar' : 'Jeda';
+    pause.setAttribute('aria-pressed', String(projectRunningSlideshowPaused));
+    pause.setAttribute(
+        'aria-label',
+        projectRunningSlideshowPaused ? 'Putar slideshow project' : 'Jeda slideshow project'
+    );
+
+    if (hasMultipleProjects && !projectRunningSlideshowPaused && !projectRunningSlideshowTimer) {
+        projectRunningSlideshowTimer = window.setInterval(() => {
+            projectRunningSlideshowIndex = (projectRunningSlideshowIndex + 1) % projectRunningRecords.length;
+            renderProjectRunningSlideshow();
+        }, 6000);
+    } else if ((!hasMultipleProjects || projectRunningSlideshowPaused) && projectRunningSlideshowTimer) {
+        window.clearInterval(projectRunningSlideshowTimer);
+        projectRunningSlideshowTimer = null;
+    }
+}
+
 function renderProjectRunningTable() {
     const tbody = document.getElementById('project-running-tbody');
     const count = document.getElementById('project-running-count');
@@ -3155,6 +3207,7 @@ async function loadProjectRunningRecords() {
 
     projectRunningRecords = data || [];
     renderProjectRunningTable();
+    renderProjectRunningSlideshow();
 }
 
 function setProjectRunningFormOpen(open, project = null) {
@@ -3315,6 +3368,19 @@ function setupProjectRunningModal() {
         setProjectRunningFormOpen(false);
     });
     document.getElementById('project-running-form').addEventListener('submit', saveProjectRunning);
+    document.getElementById('project-running-slide-previous').addEventListener('click', () => {
+        projectRunningSlideshowIndex =
+            (projectRunningSlideshowIndex + projectRunningRecords.length - 1) % projectRunningRecords.length;
+        renderProjectRunningSlideshow();
+    });
+    document.getElementById('project-running-slide-next').addEventListener('click', () => {
+        projectRunningSlideshowIndex = (projectRunningSlideshowIndex + 1) % projectRunningRecords.length;
+        renderProjectRunningSlideshow();
+    });
+    document.getElementById('project-running-slide-pause').addEventListener('click', () => {
+        projectRunningSlideshowPaused = !projectRunningSlideshowPaused;
+        renderProjectRunningSlideshow();
+    });
     document.getElementById('project-running-tbody').addEventListener('click', event => {
         const button = event.target.closest('button[data-action][data-project-id]');
         if (!button || !isProjectRunningAdmin()) return;
@@ -3334,6 +3400,11 @@ function setupProjectRunningModal() {
         } else {
             modal.hidden = true;
         }
+    });
+
+    loadProjectRunningRecords().catch(error => {
+        console.error('[PROJECT_RUNNING] Gagal memuat notifikasi project:', error);
+        showProjectRunningToast(`Notifikasi project gagal dimuat: ${error.message}`, 'error');
     });
 }
 

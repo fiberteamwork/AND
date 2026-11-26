@@ -65,7 +65,10 @@ berhasil dan `account-api` ter-deploy. Jika fungsi gagal, periksa log di
 Supabase Dashboard → **Edge Functions → account-api → Logs**.
 
 Login dan pengelolaan akun setelahnya menggunakan Supabase Auth dan tabel profil
-bersama. Pengguna tambahan dibuat oleh admin dari menu **Kelola Akun**.
+bersama. Admin dapat membuat akun di menu **Kelola Akun**, mengubah username dan
+peran, mereset password, serta menghapus akun. Akun yang sedang digunakan tidak
+dapat dihapus atau diturunkan perannya, dan admin terakhir tidak dapat
+dihapus atau diturunkan.
 
 ## Project berjalan
 

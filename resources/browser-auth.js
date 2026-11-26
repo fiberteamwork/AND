@@ -4,6 +4,8 @@
     const SESSION_LABEL = 'eastRegionalSession';
     let authClient;
     let activeAccount = null;
+    let editingAccountId = null;
+    let editingOwnAccount = false;
     window.dashboardSupabaseClient = null;
     window.dashboardActiveAccount = null;
     let resolveReady;
@@ -134,17 +136,75 @@
     function renderAccounts(accounts) {
         const list = byId('auth-account-list');
         list.replaceChildren();
+        if (!accounts.length) {
+            const empty = document.createElement('li');
+            empty.textContent = 'Belum ada akun.';
+            list.appendChild(empty);
+            return;
+        }
+
         accounts
             .sort((left, right) => left.username.localeCompare(right.username))
             .forEach(account => {
                 const item = document.createElement('li');
-                const name = document.createElement('span');
+                const info = document.createElement('div');
+                info.className = 'auth-account-info';
+                const name = document.createElement('strong');
                 const role = document.createElement('strong');
+                const actions = document.createElement('div');
+                actions.className = 'auth-account-actions';
+                const isCurrentAccount = activeAccount &&
+                    account.username.toLowerCase() === activeAccount.username.toLowerCase();
                 name.textContent = account.username;
                 role.textContent = account.role === 'admin' ? 'Admin' : 'User';
-                item.append(name, role);
+                const details = document.createElement('small');
+                details.textContent = isCurrentAccount ? `${role.textContent} · akun Anda` : role.textContent;
+                const edit = document.createElement('button');
+                edit.type = 'button';
+                edit.dataset.accountAction = 'edit';
+                edit.textContent = 'Ubah';
+                edit.addEventListener('click', () => beginAccountEdit(account));
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.dataset.accountAction = 'delete';
+                remove.textContent = 'Hapus';
+                remove.disabled = isCurrentAccount;
+                if (isCurrentAccount) remove.title = 'Akun yang sedang digunakan tidak dapat dihapus.';
+                remove.addEventListener('click', () => deleteManagedAccount(account, remove));
+                info.append(name, details);
+                actions.append(edit, remove);
+                item.append(info, actions);
                 list.appendChild(item);
             });
+    }
+
+    function resetAccountForm() {
+        editingAccountId = null;
+        editingOwnAccount = false;
+        byId('admin-user-form').reset();
+        byId('admin-password-label').textContent = 'Password (minimal 8 karakter)';
+        byId('admin-new-password').required = true;
+        byId('admin-password-help').textContent = 'Buat password untuk akun ini. Password minimal 8 karakter.';
+        byId('admin-new-role').disabled = false;
+        byId('admin-user-submit').textContent = 'Tambah Akun';
+        byId('admin-user-cancel-edit').hidden = true;
+    }
+
+    function beginAccountEdit(account) {
+        editingAccountId = account.user_id;
+        editingOwnAccount = Boolean(activeAccount &&
+            account.username.toLowerCase() === activeAccount.username.toLowerCase());
+        byId('admin-new-username').value = account.username;
+        byId('admin-new-password').value = '';
+        byId('admin-new-password').required = false;
+        byId('admin-new-role').value = account.role;
+        byId('admin-new-role').disabled = editingOwnAccount;
+        byId('admin-password-label').textContent = 'Password baru (opsional)';
+        byId('admin-password-help').textContent = 'Kosongkan jika password tidak ingin diubah.';
+        byId('admin-user-submit').textContent = 'Simpan Perubahan';
+        byId('admin-user-cancel-edit').hidden = false;
+        setMessage('admin-user-message', '');
+        byId('admin-new-username').focus();
     }
 
     function setProfileMenuOpen(open) {
@@ -302,25 +362,84 @@
 
         byId('admin-user-form').addEventListener('submit', async event => {
             event.preventDefault();
-            const form = event.currentTarget;
             const button = byId('admin-user-submit');
+            const wasEditing = Boolean(editingAccountId);
+            const wasEditingOwnAccount = editingOwnAccount;
+            const username = byId('admin-new-username').value;
+            const role = byId('admin-new-role').value;
+            const password = byId('admin-new-password').value;
             button.disabled = true;
             setMessage('admin-user-message', '');
             try {
-                await accountApi('create', {
-                    username: byId('admin-new-username').value,
-                    password: byId('admin-new-password').value,
-                    role: byId('admin-new-role').value
-                });
-                form.reset();
-                setMessage('admin-user-message', 'Akun bersama berhasil ditambahkan.');
+                if (wasEditing) {
+                    await accountApi('update', {
+                        userId: editingAccountId,
+                        username,
+                        password,
+                        role
+                    });
+                    if (wasEditingOwnAccount && activeAccount) {
+                        activeAccount.username = username.trim();
+                        sessionStorage.setItem(SESSION_LABEL, activeAccount.username);
+                        byId('auth-session-label').textContent =
+                            `${activeAccount.username} ${activeAccount.role === 'admin' ? 'Admin' : 'User'}`;
+                    }
+                    resetAccountForm();
+                    setMessage('admin-user-message', 'Akun bersama berhasil diperbarui.');
+                } else {
+                    await accountApi('create', { username, password, role });
+                    resetAccountForm();
+                    setMessage('admin-user-message', 'Akun bersama berhasil ditambahkan.');
+                }
+            } catch (error) {
+                setMessage(
+                    'admin-user-message',
+                    getErrorMessage(error, wasEditing ? 'Akun gagal diperbarui.' : 'Akun gagal ditambahkan.')
+                );
+                button.disabled = false;
+                return;
+            }
+
+            try {
                 await refreshAccounts();
             } catch (error) {
-                setMessage('admin-user-message', getErrorMessage(error, 'Akun gagal ditambahkan.'));
-            } finally {
-                button.disabled = false;
+                console.error('[AUTH] Perubahan berhasil, tetapi daftar akun gagal dimuat:', error);
+                setMessage(
+                    'admin-user-message',
+                    `Perubahan berhasil, tetapi daftar akun gagal dimuat: ${getErrorMessage(error, 'coba muat ulang daftar.')}`
+                );
             }
+            button.disabled = false;
         });
+        byId('admin-user-cancel-edit').addEventListener('click', resetAccountForm);
+    }
+
+    async function deleteManagedAccount(account, button) {
+        if (!activeAccount || activeAccount.role !== 'admin') return;
+        if (!window.confirm(`Hapus akun "${account.username}"? Tindakan ini tidak dapat dibatalkan.`)) return;
+
+        button.disabled = true;
+        setMessage('admin-user-message', '');
+        try {
+            await accountApi('delete', { userId: account.user_id });
+            if (editingAccountId === account.user_id) resetAccountForm();
+        } catch (error) {
+            setMessage('admin-user-message', getErrorMessage(error, 'Akun gagal dihapus.'));
+            button.disabled = false;
+            return;
+        }
+
+        try {
+            await refreshAccounts();
+            setMessage('admin-user-message', `Akun "${account.username}" berhasil dihapus.`);
+        } catch (error) {
+            console.error('[AUTH] Akun berhasil dihapus, tetapi daftar gagal dimuat:', error);
+            setMessage(
+                'admin-user-message',
+                `Akun berhasil dihapus, tetapi daftar gagal dimuat: ${getErrorMessage(error, 'coba muat ulang daftar.')}`
+            );
+        }
+        button.disabled = false;
     }
 
     function loadSupabaseLibrary() {

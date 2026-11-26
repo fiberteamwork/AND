@@ -24,13 +24,21 @@ function normalizeUsername(value: unknown) {
     return typeof value === 'string' ? value.trim() : '';
 }
 
-function validateCredentials(username: string, password: unknown): asserts password is string {
+function validateUsername(username: string) {
     if (!/^[a-zA-Z0-9._-]{3,32}$/.test(username)) {
         throw new ApiError(400, 'Username harus 3-32 karakter: huruf, angka, titik, garis bawah, atau tanda hubung.');
     }
+}
+
+function validatePassword(password: unknown): asserts password is string {
     if (typeof password !== 'string' || password.length < 8 || password.length > 256) {
         throw new ApiError(400, 'Password harus 8-256 karakter.');
     }
+}
+
+function validateCredentials(username: string, password: unknown): asserts password is string {
+    validateUsername(username);
+    validatePassword(password);
 }
 
 function accountEmail(usernameKey: string) {
@@ -136,7 +144,11 @@ Deno.serve(async request => {
                 p_username_key: usernameKey
             });
             if (claimError) {
-                await adminClient.auth.admin.deleteUser(created.user.id);
+                const { error: cleanupError } = await adminClient.auth.admin.deleteUser(created.user.id);
+                if (cleanupError) {
+                    console.error('[account-api] Gagal membersihkan user Auth setelah setup admin gagal:', cleanupError);
+                    throw new Error('Setup admin gagal dan akun Auth sementara tidak dapat dibersihkan otomatis.');
+                }
                 if (claimError.message.includes('first admin already configured')) {
                     throw new ApiError(409, 'Admin pertama sudah dibuat. Silakan masuk dengan akun yang tersedia.');
                 }
@@ -174,7 +186,7 @@ Deno.serve(async request => {
             if (profile.role !== 'admin') throw new ApiError(403, 'Hanya admin yang dapat melihat daftar akun.');
             const { data: accounts, error } = await adminClient
                 .from('account_profiles')
-                .select('username, role')
+                .select('user_id, username, role')
                 .order('username');
             if (error) throw error;
             return response({ accounts: accounts || [] });
@@ -206,10 +218,137 @@ Deno.serve(async request => {
                 role
             });
             if (insertError) {
-                await adminClient.auth.admin.deleteUser(created.user.id);
+                const { error: cleanupError } = await adminClient.auth.admin.deleteUser(created.user.id);
+                if (cleanupError) {
+                    console.error('[account-api] Gagal membersihkan user Auth setelah pembuatan profil gagal:', cleanupError);
+                    throw new Error('Pembuatan profil gagal dan akun Auth sementara tidak dapat dibersihkan otomatis.');
+                }
                 if (insertError.code === '23505') throw new ApiError(409, 'Username sudah digunakan.');
                 throw insertError;
             }
+            return response({ success: true });
+        }
+        if (action === 'update') {
+            if (profile.role !== 'admin') throw new ApiError(403, 'Hanya admin yang dapat mengubah akun.');
+            const targetUserId = input.userId;
+            if (typeof targetUserId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetUserId)) {
+                throw new ApiError(400, 'Akun yang akan diubah tidak valid.');
+            }
+
+            const username = normalizeUsername(input.username);
+            validateUsername(username);
+            const usernameKey = username.toLowerCase();
+            const role = input.role;
+            if (role !== 'admin' && role !== 'user') throw new ApiError(400, 'Peran akun tidak valid.');
+            let password: string | undefined;
+            if (input.password !== undefined && input.password !== '') {
+                validatePassword(input.password);
+                password = input.password;
+            }
+
+            const { data: targetProfile, error: targetError } = await adminClient
+                .from('account_profiles')
+                .select('user_id, username, username_key, role')
+                .eq('user_id', targetUserId)
+                .maybeSingle();
+            if (targetError) throw targetError;
+            if (!targetProfile) throw new ApiError(404, 'Akun tidak ditemukan.');
+            if (targetProfile.user_id === user.id && role !== 'admin') {
+                throw new ApiError(400, 'Anda tidak dapat mengubah peran admin pada akun sendiri.');
+            }
+
+            if (targetProfile.role === 'admin' && role === 'user') {
+                const { count, error: countError } = await adminClient
+                    .from('account_profiles')
+                    .select('user_id', { count: 'exact', head: true })
+                    .eq('role', 'admin');
+                if (countError) throw countError;
+                if ((count || 0) <= 1) {
+                    throw new ApiError(409, 'Admin terakhir tidak dapat diubah menjadi user.');
+                }
+            }
+
+            const { data: updatedProfile, error: updateError } = await adminClient
+                .from('account_profiles')
+                .update({ username, username_key: usernameKey, role })
+                .eq('user_id', targetUserId)
+                .select('user_id')
+                .maybeSingle();
+            if (updateError) {
+                if (updateError.code === '23505') throw new ApiError(409, 'Username sudah digunakan.');
+                throw updateError;
+            }
+            if (!updatedProfile) throw new ApiError(404, 'Akun tidak ditemukan.');
+
+            const authUpdates: {
+                email?: string;
+                email_confirm?: boolean;
+                user_metadata?: { username: string };
+                password?: string;
+            } = {};
+            if (usernameKey !== targetProfile.username_key) {
+                authUpdates.email = accountEmail(usernameKey);
+                authUpdates.email_confirm = true;
+            }
+            if (username !== targetProfile.username) {
+                authUpdates.user_metadata = { username };
+            }
+            if (password) authUpdates.password = password;
+
+            if (Object.keys(authUpdates).length > 0) {
+                const { error: authUpdateError } = await adminClient.auth.admin.updateUserById(targetUserId, authUpdates);
+                if (authUpdateError) {
+                    const { error: rollbackError } = await adminClient
+                        .from('account_profiles')
+                        .update({
+                            username: targetProfile.username,
+                            username_key: targetProfile.username_key,
+                            role: targetProfile.role
+                        })
+                        .eq('user_id', targetUserId);
+                    if (rollbackError) {
+                        console.error('[account-api] Gagal memulihkan profil setelah update Auth gagal:', rollbackError);
+                        throw new Error('Perubahan akun gagal dan profil tidak dapat dipulihkan otomatis.');
+                    }
+                    if (authUpdateError.message.toLowerCase().includes('already') ||
+                        authUpdateError.message.toLowerCase().includes('unique')) {
+                        throw new ApiError(409, 'Username sudah digunakan.');
+                    }
+                    throw authUpdateError;
+                }
+            }
+            return response({ success: true });
+        }
+        if (action === 'delete') {
+            if (profile.role !== 'admin') throw new ApiError(403, 'Hanya admin yang dapat menghapus akun.');
+            const targetUserId = input.userId;
+            if (typeof targetUserId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetUserId)) {
+                throw new ApiError(400, 'Akun yang akan dihapus tidak valid.');
+            }
+            if (targetUserId === user.id) {
+                throw new ApiError(400, 'Anda tidak dapat menghapus akun yang sedang digunakan.');
+            }
+
+            const { data: targetProfile, error: targetError } = await adminClient
+                .from('account_profiles')
+                .select('user_id, username, role')
+                .eq('user_id', targetUserId)
+                .maybeSingle();
+            if (targetError) throw targetError;
+            if (!targetProfile) throw new ApiError(404, 'Akun tidak ditemukan.');
+            if (targetProfile.role === 'admin') {
+                const { count, error: countError } = await adminClient
+                    .from('account_profiles')
+                    .select('user_id', { count: 'exact', head: true })
+                    .eq('role', 'admin');
+                if (countError) throw countError;
+                if ((count || 0) <= 1) {
+                    throw new ApiError(409, 'Admin terakhir tidak dapat dihapus.');
+                }
+            }
+
+            const { error: deleteError } = await adminClient.auth.admin.deleteUser(targetUserId);
+            if (deleteError) throw deleteError;
             return response({ success: true });
         }
         if (action === 'change-password') {

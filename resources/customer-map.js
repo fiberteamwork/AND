@@ -3086,7 +3086,6 @@ function setupProjectDataView() {
     const overlay = document.getElementById('project-data-overlay');
     const openButton = document.getElementById('view-project-data-button');
     const closeButton = document.getElementById('project-data-close');
-    const popup = document.getElementById('popup-content');
 
     if (openButton && !openButton.dataset.projectViewBound) {
         openButton.dataset.projectViewBound = 'true';
@@ -3096,12 +3095,6 @@ function setupProjectDataView() {
         closeButton.dataset.projectViewBound = 'true';
         closeButton.addEventListener('click', () => {
             if (overlay) overlay.hidden = true;
-        });
-    }
-    if (popup && !popup.dataset.projectViewBound) {
-        popup.dataset.projectViewBound = 'true';
-        popup.addEventListener('click', event => {
-            if (event.target.closest('.project-popup-data-button')) openProjectDataView();
         });
     }
 }
@@ -3436,6 +3429,7 @@ function showProjectPopup(feature) {
     const popup = document.getElementById('popup-content');
     const projects = feature.get('projects') || [];
     if (!popup || projects.length === 0) return;
+    const [longitude, latitude] = ol.proj.toLonLat(feature.getGeometry().getCoordinates());
 
     popup.innerHTML = `
         <div class="project-popup">
@@ -3465,7 +3459,10 @@ function showProjectPopup(feature) {
                 </div>
             `;
             }).join('')}
-            <button type="button" class="project-popup-data-button">Lihat Data Project</button>
+            <a class="gps-button" target="_blank" rel="noopener noreferrer"
+                href="https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}">
+                🧍🏿 Buka GPS / Google Maps
+            </a>
         </div>
     `;
 

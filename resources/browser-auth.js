@@ -151,6 +151,9 @@
     }
 
     async function signIn(username, password) {
+        if (!authClient || !authClient.auth) {
+            throw new Error('Layanan autentikasi belum siap. Tunggu sebentar lalu coba lagi.');
+        }
         const email = `${username.trim().toLowerCase()}@accounts.eastregional.invalid`;
         const { error } = await authClient.auth.signInWithPassword({ email, password });
         if (error) throw new Error('Username atau password salah.');
@@ -310,6 +313,26 @@
         });
     }
 
+    function loadSupabaseLibrary() {
+        if (window.supabase && typeof window.supabase.createClient === 'function') {
+            return Promise.resolve();
+        }
+
+        return new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://unpkg.com/@supabase/supabase-js@2.119.2/dist/umd/supabase.js';
+            script.onload = () => {
+                if (window.supabase && typeof window.supabase.createClient === 'function') {
+                    resolve();
+                } else {
+                    reject(new Error('Library Supabase tidak menyediakan createClient.'));
+                }
+            };
+            script.onerror = () => reject(new Error('Library Supabase gagal dimuat dari CDN.'));
+            document.head.appendChild(script);
+        });
+    }
+
     async function initialize() {
         bindEvents();
         const config = window.EAST_REGIONAL_SUPABASE;
@@ -324,9 +347,15 @@
         }
 
         try {
-            authClient = window.supabase.createClient(config.url, config.anonKey, {
+            await loadSupabaseLibrary();
+            const client = window.supabase.createClient(config.url, config.anonKey, {
                 auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
             });
+            if (!client || !client.auth || !client.functions) {
+                throw new Error('Client Supabase tidak valid. Periksa pemuatan library lalu muat ulang halaman.');
+            }
+            authClient = client;
+            byId('auth-login-button').disabled = false;
             const { data: { session }, error } = await authClient.auth.getSession();
             if (error) throw error;
             if (session) {

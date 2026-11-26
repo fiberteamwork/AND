@@ -258,8 +258,7 @@
     margin-top: 8px;
 }
 
-.project-link-button,
-.project-popup-data-button {
+.project-link-button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -274,16 +273,9 @@
     cursor: pointer;
 }
 
-.project-link-button:hover,
-.project-popup-data-button:hover {
+.project-link-button:hover {
     background: #12558a;
     color: white;
-}
-
-.project-popup-data-button {
-    width: 100%;
-    margin-top: 10px;
-    background: #0d9103;
 }
 
 .project-data-overlay {
@@ -496,6 +488,31 @@ body:not(.auth-ready) #project-data-overlay {
 .auth-primary:disabled {
     cursor: wait;
     opacity: .65;
+}
+
+.auth-secondary {
+    width: 100%;
+    min-height: 40px;
+    margin-top: 8px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    background: #f8fafc;
+    color: #334155;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.auth-secondary:hover {
+    background: #eef2f7;
+}
+
+.admin-user-help {
+    display: block;
+    margin: -2px 0 10px;
+    color: #64748b;
+    font-size: 12px;
+    line-height: 1.45;
 }
 
 .auth-message {
@@ -779,10 +796,53 @@ body:not(.auth-ready) #project-data-overlay {
 
 .auth-account-list li {
     display: flex;
+    align-items: center;
     justify-content: space-between;
+    gap: 12px;
     padding: 9px 0;
     border-bottom: 1px solid #e5e7eb;
     font-size: 13px;
+}
+
+.auth-account-info {
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+}
+
+.auth-account-info small {
+    color: #64748b;
+}
+
+.auth-account-actions {
+    display: flex;
+    flex-shrink: 0;
+    gap: 6px;
+}
+
+.auth-account-actions button {
+    padding: 6px 9px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    background: #fff;
+    color: #334155;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+}
+
+.auth-account-actions button:hover:not(:disabled) {
+    background: #f1f5f9;
+}
+
+.auth-account-actions button[data-account-action="delete"] {
+    border-color: #fecaca;
+    color: #b42318;
+}
+
+.auth-account-actions button:disabled {
+    cursor: not-allowed;
+    opacity: .5;
 }
 
 @media (max-width: 600px) {
@@ -792,6 +852,11 @@ body:not(.auth-ready) #project-data-overlay {
 
     .auth-card {
         padding: 26px 22px;
+    }
+
+    .auth-account-list li {
+        align-items: flex-start;
+        flex-direction: column;
     }
 }
         html, body {
@@ -866,24 +931,27 @@ body:not(.auth-ready) #project-data-overlay {
         <div class="user-management-header">
             <div>
                 <h2 id="user-management-title">Kelola Akun</h2>
-                <p class="auth-subtitle" style="text-align:left; margin:8px 0 14px;">Tambah akun admin atau user yang dapat digunakan di semua perangkat.</p>
+                <p class="auth-subtitle" style="text-align:left; margin:8px 0 14px;">Tambah, ubah, atau hapus akun admin dan user, termasuk akun yang sedang digunakan.</p>
             </div>
             <button type="button" id="user-management-close" class="btn btn-danger">X Tutup</button>
         </div>
         <form id="admin-user-form" class="admin-user-form">
             <label for="admin-new-username">Username</label>
-            <input id="admin-new-username" name="username" minlength="3" maxlength="32" autocomplete="off" required>
-            <label for="admin-new-password">Password (minimal 8 karakter)</label>
-            <input id="admin-new-password" name="password" type="password" minlength="8" autocomplete="new-password" required>
+            <input id="admin-new-username" name="username" minlength="3" maxlength="32" autocomplete="off" aria-describedby="admin-username-help" required>
+            <small id="admin-username-help" class="admin-user-help">Username ini digunakan untuk masuk ke akun.</small>
+            <label id="admin-password-label" for="admin-new-password">Password (minimal 8 karakter)</label>
+            <input id="admin-new-password" name="password" type="password" minlength="8" autocomplete="new-password" aria-describedby="admin-password-help" required>
+            <small id="admin-password-help" class="admin-user-help">Buat password untuk akun ini. Password minimal 8 karakter.</small>
             <label for="admin-new-role">Peran</label>
             <select id="admin-new-role" name="role">
                 <option value="user">User</option>
                 <option value="admin">Admin</option>
             </select>
             <button id="admin-user-submit" class="auth-primary" type="submit">Tambah Akun</button>
+            <button id="admin-user-cancel-edit" class="auth-secondary" type="button" hidden>Batal Ubah</button>
             <p id="admin-user-message" class="auth-message" role="status"></p>
         </form>
-        <h3>Akun di browser ini</h3>
+        <h3>Daftar akun bersama</h3>
         <ul id="auth-account-list" class="auth-account-list"></ul>
     </div>
 </section>
@@ -1104,9 +1172,8 @@ body:not(.auth-ready) #project-data-overlay {
                 <div id="popup-content"></div>
             </div>
         </div>
-        <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
         <script defer src="./resources/supabase-config.js?v=20261123.5"></script>
-        <script defer src="./resources/browser-auth.js?v=20261123.14"></script>
+        <script defer src="./resources/browser-auth.js?v=20261124.7"></script>
         
     </body>
 </html>

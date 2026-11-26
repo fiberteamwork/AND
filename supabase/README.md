@@ -66,3 +66,12 @@ Supabase Dashboard → **Edge Functions → account-api → Logs**.
 
 Login dan pengelolaan akun setelahnya menggunakan Supabase Auth dan tabel profil
 bersama. Pengguna tambahan dibuat oleh admin dari menu **Kelola Akun**.
+
+## Project berjalan
+
+Menu **Project Berjalan** menampilkan data yang disimpan di tabel
+`projects_berjalan`. Pengguna yang sudah masuk dapat melihat daftar, sedangkan
+admin dapat menambah, mengubah, dan menghapus data Kota, Lokasi Project, serta
+Nama Project. Akses tulis dibatasi oleh Row Level Security berdasarkan peran
+admin pada `account_profiles`; migrasi tabel dan kebijakan ini diterapkan oleh
+workflow deployment Supabase di atas.

@@ -21,6 +21,9 @@ let customers = [];
 let projectRecords = [];
 let filteredProjectRecords = [];
 let projectLayer = null;
+let projectRunningRecords = [];
+let projectRunningEditingId = null;
+let projectRunningToastTimer = null;
 const siteValuesCache = new Map();
 const MAX_SITE_DROPDOWN_OPTIONS = 100;
 let customerLayer = null;
@@ -3097,6 +3100,241 @@ function setupProjectDataView() {
             if (overlay) overlay.hidden = true;
         });
     }
+    setupProjectRunningModal();
+}
+
+function isProjectRunningAdmin() {
+    return window.dashboardActiveAccount?.role === 'admin';
+}
+
+function showProjectRunningToast(message, type = 'success') {
+    const toast = document.getElementById('project-running-toast');
+    if (!toast) return;
+    window.clearTimeout(projectRunningToastTimer);
+    toast.textContent = message;
+    toast.dataset.type = type;
+    toast.hidden = false;
+    projectRunningToastTimer = window.setTimeout(() => {
+        toast.hidden = true;
+    }, type === 'error' ? 7000 : 4000);
+}
+
+function renderProjectRunningTable() {
+    const tbody = document.getElementById('project-running-tbody');
+    const count = document.getElementById('project-running-count');
+    const admin = isProjectRunningAdmin();
+    if (!tbody) return;
+
+    tbody.innerHTML = projectRunningRecords.length
+        ? projectRunningRecords.map(project => `
+            <tr>
+                <td>${escapeHtml(project.city)}</td>
+                <td>${escapeHtml(project.location)}</td>
+                <td>${escapeHtml(project.name)}</td>
+                ${admin ? `<td><div class="project-running-actions">
+                    <button class="project-running-edit" type="button" data-action="edit" data-project-id="${escapeHtml(project.id)}">Ubah</button>
+                    <button class="project-running-delete" type="button" data-action="delete" data-project-id="${escapeHtml(project.id)}">Hapus</button>
+                </div></td>` : ''}
+            </tr>
+        `).join('')
+        : `<tr><td colspan="${admin ? 4 : 3}" style="color:#64748b; text-align:center;">Belum ada project berjalan.</td></tr>`;
+    if (count) count.textContent = `${projectRunningRecords.length} project berjalan`;
+}
+
+async function loadProjectRunningRecords() {
+    const client = window.dashboardSupabaseClient;
+    if (!client || typeof client.from !== 'function') {
+        throw new Error('Sesi Supabase tidak tersedia. Silakan masuk kembali.');
+    }
+
+    const { data, error } = await client
+        .from('projects_berjalan')
+        .select('id, city, location, name, created_at')
+        .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    projectRunningRecords = data || [];
+    renderProjectRunningTable();
+}
+
+function setProjectRunningFormOpen(open, project = null) {
+    if (open && !isProjectRunningAdmin()) return;
+    const form = document.getElementById('project-running-form');
+    const title = document.getElementById('project-running-title');
+    if (!form) return;
+
+    form.reset();
+    projectRunningEditingId = project ? project.id : null;
+    form.hidden = !open;
+    if (project) {
+        document.getElementById('project-running-city').value = project.city;
+        document.getElementById('project-running-location').value = project.location;
+        document.getElementById('project-running-name').value = project.name;
+    }
+    if (title) title.textContent = project ? 'Ubah Project Berjalan' : 'Project Berjalan';
+    if (open) document.getElementById('project-running-city').focus();
+}
+
+async function openProjectRunningModal() {
+    if (!isProjectRunningAdmin()) return;
+    const modal = document.getElementById('project-running-modal');
+    if (!modal) return;
+    modal.hidden = false;
+    document.getElementById('project-running-add').hidden = !isProjectRunningAdmin();
+    document.getElementById('project-running-actions-heading').hidden = !isProjectRunningAdmin();
+    setProjectRunningFormOpen(false);
+    renderProjectRunningTable();
+    try {
+        await loadProjectRunningRecords();
+    } catch (error) {
+        console.error('[PROJECT_RUNNING] Gagal memuat project:', error);
+        showProjectRunningToast(`Daftar project gagal dimuat: ${error.message}`, 'error');
+    }
+}
+
+async function saveProjectRunning(event) {
+    event.preventDefault();
+    if (!isProjectRunningAdmin()) {
+        showProjectRunningToast('Hanya admin yang dapat mengubah project berjalan.', 'error');
+        return;
+    }
+
+    const form = event.currentTarget;
+    const submit = document.getElementById('project-running-submit');
+    const payload = {
+        city: document.getElementById('project-running-city').value.trim(),
+        location: document.getElementById('project-running-location').value.trim(),
+        name: document.getElementById('project-running-name').value.trim()
+    };
+    if (Object.values(payload).some(value => !value)) {
+        showProjectRunningToast('Kota, lokasi project, dan nama project wajib diisi.', 'error');
+        return;
+    }
+
+    submit.disabled = true;
+    let successMessage;
+    try {
+        const client = window.dashboardSupabaseClient;
+        if (!client) throw new Error('Sesi Supabase tidak tersedia. Silakan masuk kembali.');
+        if (projectRunningEditingId) {
+            const { data, error } = await client
+                .from('projects_berjalan')
+                .update(payload)
+                .eq('id', projectRunningEditingId)
+                .select('id')
+                .maybeSingle();
+            if (error) throw error;
+            if (!data) throw new Error('Project tidak ditemukan atau Anda tidak memiliki izin untuk mengubahnya.');
+            successMessage = 'Project berjalan berhasil diperbarui.';
+        } else {
+            const { error } = await client
+                .from('projects_berjalan')
+                .insert(payload);
+            if (error) throw error;
+            successMessage = 'Project berjalan berhasil ditambahkan.';
+        }
+    } catch (error) {
+        console.error('[PROJECT_RUNNING] Gagal menyimpan project:', error);
+        showProjectRunningToast(`Project gagal disimpan: ${error.message}`, 'error');
+        submit.disabled = false;
+        return;
+    }
+
+    form.reset();
+    setProjectRunningFormOpen(false);
+    try {
+        await loadProjectRunningRecords();
+        showProjectRunningToast(successMessage);
+    } catch (error) {
+        console.error('[PROJECT_RUNNING] Project tersimpan, tetapi daftar gagal diperbarui:', error);
+        showProjectRunningToast(`Project tersimpan, tetapi daftar gagal diperbarui: ${error.message}`, 'error');
+    } finally {
+        submit.disabled = false;
+    }
+}
+
+async function deleteProjectRunning(id) {
+    if (!isProjectRunningAdmin()) {
+        showProjectRunningToast('Hanya admin yang dapat menghapus project berjalan.', 'error');
+        return;
+    }
+    if (!window.confirm('Hapus project berjalan ini?')) return;
+
+    try {
+        const client = window.dashboardSupabaseClient;
+        if (!client) throw new Error('Sesi Supabase tidak tersedia. Silakan masuk kembali.');
+        const { data, error } = await client
+            .from('projects_berjalan')
+            .delete()
+            .eq('id', id)
+            .select('id')
+            .maybeSingle();
+        if (error) throw error;
+        if (!data) throw new Error('Project tidak ditemukan atau Anda tidak memiliki izin untuk menghapusnya.');
+    } catch (error) {
+        console.error('[PROJECT_RUNNING] Gagal menghapus project:', error);
+        showProjectRunningToast(`Project gagal dihapus: ${error.message}`, 'error');
+        return;
+    }
+
+    try {
+        await loadProjectRunningRecords();
+        showProjectRunningToast('Project berjalan berhasil dihapus.');
+    } catch (error) {
+        console.error('[PROJECT_RUNNING] Project terhapus, tetapi daftar gagal diperbarui:', error);
+        showProjectRunningToast(`Project terhapus, tetapi daftar gagal diperbarui: ${error.message}`, 'error');
+    }
+}
+
+function setupProjectRunningModal() {
+    const modal = document.getElementById('project-running-modal');
+    const openButton = document.getElementById('auth-project-running');
+    if (!modal || !openButton || modal.dataset.projectRunningBound) return;
+    modal.dataset.projectRunningBound = 'true';
+
+    openButton.addEventListener('click', () => {
+        if (!isProjectRunningAdmin()) return;
+        document.getElementById('auth-profile-dropdown').hidden = true;
+        document.getElementById('auth-profile-toggle').setAttribute('aria-expanded', 'false');
+        openProjectRunningModal();
+    });
+    document.getElementById('project-running-close').addEventListener('click', () => {
+        modal.hidden = true;
+        setProjectRunningFormOpen(false);
+    });
+    modal.addEventListener('click', event => {
+        if (event.target === modal) {
+            modal.hidden = true;
+            setProjectRunningFormOpen(false);
+        }
+    });
+    document.getElementById('project-running-add').addEventListener('click', () => {
+        setProjectRunningFormOpen(true);
+    });
+    document.getElementById('project-running-cancel').addEventListener('click', () => {
+        setProjectRunningFormOpen(false);
+    });
+    document.getElementById('project-running-form').addEventListener('submit', saveProjectRunning);
+    document.getElementById('project-running-tbody').addEventListener('click', event => {
+        const button = event.target.closest('button[data-action][data-project-id]');
+        if (!button || !isProjectRunningAdmin()) return;
+        const project = projectRunningRecords.find(record => record.id === button.dataset.projectId);
+        if (!project) {
+            showProjectRunningToast('Project tidak ditemukan. Muat ulang daftar project.', 'error');
+        } else if (button.dataset.action === 'edit') {
+            setProjectRunningFormOpen(true, project);
+        } else if (button.dataset.action === 'delete') {
+            deleteProjectRunning(project.id);
+        }
+    });
+    document.addEventListener('keydown', event => {
+        if (event.key !== 'Escape' || modal.hidden) return;
+        if (!document.getElementById('project-running-form').hidden) {
+            setProjectRunningFormOpen(false);
+        } else {
+            modal.hidden = true;
+        }
+    });
 }
 
 function getProjectDateTimestamp(value) {

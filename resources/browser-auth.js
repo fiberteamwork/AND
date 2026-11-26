@@ -4,6 +4,8 @@
     const SESSION_LABEL = 'eastRegionalSession';
     let authClient;
     let activeAccount = null;
+    window.dashboardSupabaseClient = null;
+    window.dashboardActiveAccount = null;
     let resolveReady;
     const ready = new Promise(resolve => {
         resolveReady = resolve;
@@ -33,7 +35,7 @@
             'resources/Autolinker.min.js',
             'resources/qgis2web.js',
             'https://cdn.jsdelivr.net/npm/chart.js',
-            'resources/customer-map.js?v=20261123.15'
+            'resources/customer-map.js?v=20261126.17'
         ];
 
         const loadingMessage = byId('map-loading-message');
@@ -86,10 +88,13 @@
 
     function loginAccount(account) {
         activeAccount = { username: account.username, role: account.role };
+        window.dashboardSupabaseClient = authClient;
+        window.dashboardActiveAccount = activeAccount;
         sessionStorage.setItem(SESSION_LABEL, account.username);
         byId('auth-session-label').textContent =
             `${activeAccount.username} ${activeAccount.role === 'admin' ? 'Admin' : 'User'}`;
         byId('auth-manage-users').hidden = activeAccount.role !== 'admin';
+        byId('auth-project-running').hidden = activeAccount.role !== 'admin';
         setProfileMenuOpen(false);
         byId('auth-gate').hidden = true;
         document.body.classList.add('auth-ready');
@@ -103,6 +108,9 @@
 
     function showLogin() {
         activeAccount = null;
+        window.dashboardSupabaseClient = null;
+        window.dashboardActiveAccount = null;
+        byId('auth-project-running').hidden = true;
         setProfileMenuOpen(false);
         sessionStorage.removeItem(SESSION_LABEL);
         document.body.classList.remove('auth-ready');
@@ -111,6 +119,8 @@
         byId('auth-login-view').hidden = false;
         byId('user-management-modal').hidden = true;
         byId('change-password-modal').hidden = true;
+        byId('project-running-modal').hidden = true;
+        byId('project-running-toast').hidden = true;
         byId('auth-login-username').focus();
     }
 

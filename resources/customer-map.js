@@ -3059,9 +3059,17 @@ function renderProjectDataTable() {
     const count = document.getElementById('project-data-count');
     if (!tbody) return;
 
-    const projectGroups = groupProjectsByName(filteredProjectRecords);
+    const cityQuery = normalize(document.getElementById('project-data-search-city')?.value || '').toLowerCase();
+    const locationQuery = normalize(document.getElementById('project-data-search-location')?.value || '').toLowerCase();
+    const records = cityQuery || locationQuery
+        ? filteredProjectRecords.filter(project =>
+            normalize(project.city).toLowerCase().includes(cityQuery) &&
+            normalize(project.location).toLowerCase().includes(locationQuery)
+        )
+        : filteredProjectRecords;
+    const projectGroups = groupProjectsByName(records);
     const totalProjectCount = groupProjectsByName(projectRecords).length;
-    tbody.innerHTML = projectGroups.map(projectGroup => {
+    tbody.innerHTML = projectGroups.length ? projectGroups.map(projectGroup => {
         const project = projectGroup[0];
         const milestones = sortProjectMilestones(projectGroup);
         return `
@@ -3076,7 +3084,7 @@ function renderProjectDataTable() {
             <td>${projectLinkButton(project.documentationUrl, 'Buka Dokumentasi') || '-'}</td>
         </tr>
     `;
-    }).join('');
+    }).join('') : '<tr><td colspan="8" style="text-align:center; padding:16px;">Tidak ada project yang cocok.</td></tr>';
 
     if (count) count.textContent = `${projectGroups.length} dari ${totalProjectCount} project`;
 }
@@ -3092,11 +3100,20 @@ function setupProjectDataView() {
     const overlay = document.getElementById('project-data-overlay');
     const openButton = document.getElementById('view-project-data-button');
     const closeButton = document.getElementById('project-data-close');
+    const searchInputs = [
+        document.getElementById('project-data-search-city'),
+        document.getElementById('project-data-search-location')
+    ].filter(Boolean);
 
     if (openButton && !openButton.dataset.projectViewBound) {
         openButton.dataset.projectViewBound = 'true';
         openButton.addEventListener('click', openProjectDataView);
     }
+    searchInputs.forEach(searchInput => {
+        if (searchInput.dataset.projectViewBound) return;
+        searchInput.dataset.projectViewBound = 'true';
+        searchInput.addEventListener('input', renderProjectDataTable);
+    });
     if (closeButton && !closeButton.dataset.projectViewBound) {
         closeButton.dataset.projectViewBound = 'true';
         closeButton.addEventListener('click', () => {
